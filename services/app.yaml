@@ -1,0 +1,12 @@
+runtime: python311
+service: ainyfin
+instance_class: F1 
+
+entrypoint: gunicorn -b :$PORT main:app --workers 2 --threads 4
+
+automatic_scaling:
+  min_instances: 0  # Zero cost when idle
+  max_instances: 2
+
+env_variables:
+  GCS_BUCKET_NAME: "ainy-fin-models"
