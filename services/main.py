@@ -33,18 +33,18 @@ def download_model_from_gcs():
 download_model_from_gcs()
 
 FEATURES = [
-    'Close', 'Volume', 'targetMedianPrice', 'beta', 
-    'fiftyTwoWeekLow', 'fiftyTwoWeekHigh', 'shortRatio', 
+    'Close', 'Volume', 'targetMedianPrice', 'beta',
+    'fiftyTwoWeekLow', 'fiftyTwoWeekHigh', 'shortRatio',
     'epsForward', 'forwardPE', 'pegRatio', 'revenueGrowth',
     'dividendYield', 'fiftyDayAverage', 'averageAnalystRating_float'
 ]
 
-BHS_DESCS = ["Strong Sell", "Sell", "Hold", "Buy", "Strong Buy"]
+BHS_DESCS = ["Sell", "Hold", "Buy"]
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
-        "status": "ok", 
+        "status": "ok",
         "model_loaded": loaded_model is not None
     }), 200
 
@@ -80,10 +80,10 @@ def predict():
 
         current_metrics_df = pd.concat(metrics_df_list, ignore_index=True)
         current_metrics_df.rename(columns={"previousClose": "Close", "volume": "Volume"}, inplace=True)
-        
+
         # Format ratings
         current_metrics_df['averageAnalystRating_float'] = pd.to_numeric(
-            current_metrics_df['averageAnalystRating'].astype(str).str.split('-').str[0], 
+            current_metrics_df['averageAnalystRating'].astype(str).str.split('-').str[0],
             errors='coerce'
         ).fillna(0.0)
 
@@ -92,7 +92,7 @@ def predict():
 
         # Predict
         out_pred = loaded_model.predict(input_df)
-        
+
         results = []
         for ticker, score in zip(orgs, out_pred):
             # Class index mapping safely (0-indexed to descriptions)

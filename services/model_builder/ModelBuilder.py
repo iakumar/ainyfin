@@ -1,117 +1,384 @@
+import sys
 import os
-from datetime import datetime
+import typing
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import joblib
-import pandas as pd
-import requests
-from google.cloud import storage
-from sklearn.model_selection import train_test_split
-from xgboost import XGBClassifier
-
-# Environment variables configured in Cloud Run
-BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "ainy-fin-models")
-APP_ENGINE_URL = os.environ.get("APP_ENGINE_URL", "https://your-app-id.appspot.com")
-MODEL_FILENAME = "xgboost_bhs_model.joblib"
-
-from datetime import date, datetime, timedelta, timezone
-
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
-from sklearn.ensemble import GradientBoostingClassifier, HistGradientBoostingClassifier
-from sklearn.metrics import accuracy_score
-from sklearn.model_selection import train_test_split
+from google.cloud import storage
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 
+BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "anypug.appspot.com")
+DIRECTORY_NAME = "ainyfin/models"
+APP_ENGINE_URL = os.environ.get(
+    "APP_ENGINE_URL", "https://ainyfin.appspot.com"
+)
+GBMODEL_FILENAME = "gboost_bhs_model.joblib"
+XGBMODEL_FILENAME = "xgboost_bhs_model.joblib"
 
 class ModelBuilder:
+    DATA_DIR = "/Users/rithuhegde/ainyfin/services/data"
+
     def __init__(self, builder: str, n_estimators: int = 100):
+        self.target_column = "bhsScore"
+        self.bhs_descs = ["Sell", "Hold", "Buy"]
+        # Explicit list of generated ratio columns
+        self.ratio_columns = [
+            "Price_To_Earnings",
+            "Price_To_FreeCashFlow",
+            "Price_To_Book",
+            "Price_To_Sales",
+            "EV_To_EBITDA",
+            "EV_To_EBIT",
+            "Gross_Margin",
+            "Operating_Margin",
+            "EBITDA_Margin",
+            "Net_Margin",
+            "FCF_Margin",
+            "Return_On_Equity",
+            "Return_On_Assets",
+            "Debt_To_Equity",
+            "Debt_To_Assets",
+            "Current_Ratio",
+            "Quick_Ratio",
+            "Interest_Coverage",
+            "Cash_To_Debt",
+            "Asset_Turnover",
+            "Working_Capital_Turnover",
+            "CFO_To_NetIncome",
+            "SBC_To_Revenue",
+            "CapEx_To_CFO",
+            "CapEx_To_Revenue",
+            "R_And_D_To_Revenue",
+        ]
+
+        self.training_columns = self.ratio_columns +  ["Close", "bhsScore"]
+        print("training_columns:", self.training_columns)
         self.builder = builder
         self.n_estimators = n_estimators
-        self.gb_model = None
+        self.xg_model = None
 
-    def train(self, feature_df):
-        target_column = "bhsScore"
-        self.training_columns = [
-            "bhsScore",
-            "Close",
-            "Volume",
-            "targetMedianPrice",
-            "beta",
-            "fiftyTwoWeekLow",
-            "fiftyTwoWeekHigh",
-            "shortRatio",
-            "epsForward",
-            "forwardPE",
-            "pegRatio",
-            "revenueGrowth",
-            "dividendYield",
-            "fiftyDayAverage",
-            "averageAnalystRating_float",
-        ]
-        df = feature_df[self.training_columns]
-        # print(target_column,":", feature_df[target_column])
+
+    def load_train_data(self) -> pd.DataFrame:
+        """
+        Fetch your historical training feature dataset...
+        """
+        print("Fetching historical training feature dataset...")
+        raw_df = pd.read_csv(ModelBuilder.DATA_DIR+'/ainyfina-input.csv')
+        feature_df = self.compute_financial_ratios(raw_df).dropna()
+        feature_df[["bhsScore", "Close"]] = raw_df[["bhsScore", "Close"]].replace([np.inf, -np.inf], np.nan)
+        return feature_df
+
+
+    def compute_financial_ratios(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Computes standardized valuation, leverage, profitability, and quality ratios
+        from raw SEC fundamental and market price data.
+
+        Parameters:
+        -----------
+        df : pd.DataFrame
+            Must contain raw fundamental columns and 'Close' market price.
+
+        Returns:
+        --------
+        pd.DataFrame
+            DataFrame augmented with engineered ratio features.
+        """
+
+        # Define helper to prevent Division-by-Zero and np.inf errors
+        def safe_divide(
+            numerator: pd.Series, denominator: pd.Series
+        ) -> pd.Series:
+            return np.where(
+                (denominator == 0) | (denominator.isna()),
+                np.nan,
+                numerator / denominator,
+            )
+
+        # Create a copy to prevent mutating the input DataFrame
+        data = df.copy()
+
+        # 1. Valuation Ratios
+        data["Price_To_Earnings"] = safe_divide(data["Close"], data["DilutedEPS"])
+        data["Price_To_FreeCashFlow"] = safe_divide(
+            data["Close"] * data["DilutedAverageShares"], data["FreeCashFlow"]
+        )
+        data["Price_To_Book"] = safe_divide(
+            data["Close"] * data["DilutedAverageShares"], data["StockholdersEquity"]
+        )
+        data["Price_To_Sales"] = safe_divide(
+            data["Close"] * data["DilutedAverageShares"], data["TotalRevenue"]
+        )
+        data["EV_To_EBITDA"] = safe_divide(
+            (data["Close"] * data["DilutedAverageShares"])
+            + data["TotalDebt"]
+            - data["CashCashEquivalentsAndShortTermInvestments"],
+            data["NormalizedEBITDA"],
+        )
+        data["EV_To_EBIT"] = safe_divide(
+            (data["Close"] * data["DilutedAverageShares"])
+            + data["TotalDebt"]
+            - data["CashCashEquivalentsAndShortTermInvestments"],
+            data["EBIT"],
+        )
+
+        # 2. Profitability & Margins
+        data["Gross_Margin"] = safe_divide(
+            data["GrossProfit"], data["OperatingRevenue"]
+        )
+        data["Operating_Margin"] = safe_divide(
+            data["OperatingIncome"], data["TotalRevenue"]
+        )
+        data["EBITDA_Margin"] = safe_divide(
+            data["NormalizedEBITDA"], data["TotalRevenue"]
+        )
+        data["Net_Margin"] = safe_divide(
+            data["NetIncome"], data["TotalRevenue"]
+        )
+        data["FCF_Margin"] = safe_divide(
+            data["FreeCashFlow"], data["TotalRevenue"]
+        )
+        data["Return_On_Equity"] = safe_divide(
+            data["NetIncomeCommonStockholders"], data["CommonStockEquity"]
+        )
+        data["Return_On_Assets"] = safe_divide(
+            data["NetIncome"], data["TotalAssets"]
+        )
+
+        # 3. Leverage, Solvency & Liquidity
+        data["Debt_To_Equity"] = safe_divide(
+            data["TotalDebt"], data["StockholdersEquity"]
+        )
+        data["Debt_To_Assets"] = safe_divide(
+            data["TotalDebt"], data["TotalAssets"]
+        )
+        data["Current_Ratio"] = safe_divide(
+            data["CurrentAssets"], data["CurrentLiabilities"]
+        )
+        data["Quick_Ratio"] = safe_divide(
+            data["CashCashEquivalentsAndShortTermInvestments"] + data["AccountsReceivable"],
+            data["CurrentLiabilities"],
+        )
+        data["Interest_Coverage"] = safe_divide(
+            data["EBIT"], data["InterestExpense"].abs()
+        )
+        data["Cash_To_Debt"] = safe_divide(
+            data["CashCashEquivalentsAndShortTermInvestments"], data["TotalDebt"]
+        )
+
+        # 4. Operational Efficiency
+        data["Asset_Turnover"] = safe_divide(
+            data["TotalRevenue"], data["TotalAssets"]
+        )
+        data["Working_Capital_Turnover"] = safe_divide(
+            data["TotalRevenue"], data["WorkingCapital"]
+        )
+
+        # 5. Earnings Quality & Capital Allocation
+        data["CFO_To_NetIncome"] = safe_divide(
+            data["OperatingCashFlow"], data["NetIncome"]
+        )
+        data["SBC_To_Revenue"] = safe_divide(
+            data["StockBasedCompensation"], data["TotalRevenue"]
+        )
+        data["CapEx_To_CFO"] = safe_divide(
+            data["CapitalExpenditure"].abs(), data["OperatingCashFlow"]
+        )
+        data["CapEx_To_Revenue"] = safe_divide(
+            data["CapitalExpenditure"].abs(), data["TotalRevenue"]
+        )
+        data["R_And_D_To_Revenue"] = safe_divide(
+            data["ResearchAndDevelopment"], data["TotalRevenue"]
+        )
+
+        # Clean extreme inf / -inf values on calculated ratio columns only
+        data[self.ratio_columns] = data[self.ratio_columns].replace([np.inf, -np.inf], np.nan)
+
+        return data
+
+
+    def transformFeatureXY(self, X: pd.DataFrame, org: str) -> pd.DataFrame:
+        df_transformed = X.T
+        # 1. Convert date headers from the index into a dedicated 'Date' column
+        df_transformed = df_transformed.reset_index().rename(columns={'index': 'Date'})
+        # 2. Ensure Date is datetime type
+        df_transformed['Date'] = pd.to_datetime(df_transformed['Date'])
+        df_transformed['Ticker'] = org
+        return df_transformed
+
+
+    def load_test_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+        feature_df = self.load_train_data()[self.training_columns].dropna()
+        # print(self.target_column,":", feature_df[self.target_column])
         # print("feature_df:", df.shape, feature_df.columns)
 
         # 7. Separate features and target
-        X = df.drop(columns=[target_column])
-        y = df[target_column]
+        X = feature_df.drop(columns=[self.target_column])
+        y = feature_df[self.target_column] - 1  # Shift 1-5 rating to 0-4 for XGBoost
 
-        # 8. Split data for training
-        X_train, self.X_test, y_train, self.y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.3, random_state=42, stratify=y
         )
+        return X_test, y_test
 
-        print("final_df y_train:", feature_df[target_column].unique())
 
-        # 9. Initialize Gradient Boosting Classifier
-        # Multi-class uses 'multinomial' deviance loss automatically
-        self.gb_model = GradientBoostingClassifier(
-            n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42
-        )
+    def train(self, feature_df):
+        df = feature_df[self.training_columns].dropna()
 
-        # 10. Train the model
-        self.gb_model.fit(X_train, y_train)
-        print("\ngb_model classes:", self.gb_model.n_classes_, self.gb_model.classes_)
+        # 1. Separate features and target
+        X = df.drop(columns=[self.target_column]).dropna()
+        y = df[self.target_column] - 1  # Shift 1-3 rating to 0-3 for XGBoost
 
-        le = LabelEncoder()
-        y_train = le.fit_transform(y_train)
-        self.xg_model = XGBClassifier(
-            n_estimators=100,
+        n_splits: int = 5
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+        oof_predictions = np.zeros(len(df))
+        cv_accuracies = []
+        cv_f1_scores = []
+
+        print(f"\n=== Starting {n_splits}-Fold Stratified Cross-Validation ===")
+
+        print("final_df y_train:", feature_df[self.target_column].unique())
+
+        # 3. Iterate through folds
+        for fold, (train_idx, val_idx) in enumerate(skf.split(X, y), start=1):
+            X_train_fold, X_val_fold = X.iloc[train_idx], X.iloc[val_idx]
+            y_train_fold, y_val_fold = y.iloc[train_idx], y.iloc[val_idx]
+
+            # 9. Initialize Gradient Boosting Classifier
+            # Multi-class uses 'multinomial' deviance loss automatically
+            """
+            fold_model = XGBClassifier(
+                n_estimators=self.n_estimators,
+                        learning_rate=0.05,
+                        max_depth=5,
+                        objective="multi:softprob",
+                        eval_metric="mlogloss",
+                        random_state=42,
+            )
+            """
+
+            fold_model = XGBClassifier(
+                    n_estimators=50,
+                    max_depth=3,  # Reduce depth from 5 to 3
+                    learning_rate=0.03,
+                    subsample=0.8,  # Randomly sample 80% of rows per tree
+                    colsample_bytree=0.8,  # Randomly sample 80% of features per tree
+                    reg_alpha=1.0,  # L1 regularization
+                    reg_lambda=1.0,  # L2 regularization
+            )
+
+            # 10. Train the model
+            fold_model.fit(X_train_fold, y_train_fold)
+            print("fold_model classes:", fold_model.n_classes_, fold_model.classes_)
+
+            # Predict on validation fold
+            val_preds = fold_model.predict(X_val_fold)
+            oof_predictions[val_idx] = val_preds
+            bhs_desc = [self.bhs_descs[value] for value in val_preds]
+            print(f"BHS: {bhs_desc}")
+
+            # Metric evaluation
+            fold_acc = accuracy_score(y_val_fold, val_preds)
+            fold_f1 = f1_score(y_val_fold, val_preds, average="weighted")
+
+            cv_accuracies.append(fold_acc)
+            cv_f1_scores.append(fold_f1)
+
+            print(
+                f"Fold {fold}/{n_splits} - Accuracy: {fold_acc * 100:.2f}% | Weighted"
+                f" F1: {fold_f1:.4f}"
+            )
+
+            # 4. Out-of-fold aggregate summary
+            mean_acc = np.mean(cv_accuracies)
+            std_acc = np.std(cv_accuracies)
+            mean_f1 = np.mean(cv_f1_scores)
+
+            print("-" * 50)
+            print(f"CV Mean Accuracy: {mean_acc * 100:.2f}% (+/- {std_acc * 100:.2f}%)")
+            print(f"CV Mean Weighted F1: {mean_f1:.4f}")
+            print("-" * 50)
+
+        # 5. Retrain final model on 100% of the dataset for production deployment
+        print("Retraining final production model on entire dataset...")
+
+        """
+        final_xg_model = XGBClassifier(
+            n_estimators=self.n_estimators,
             learning_rate=0.05,
             max_depth=5,
             objective="multi:softprob",
+            eval_metric="mlogloss",
+            random_state=42,
+        )
+        """
+
+        final_xg_model = XGBClassifier(
+            n_estimators=50,
+            max_depth=3,  # Reduce depth from 5 to 3
+            learning_rate=0.03,
+            subsample=0.8,  # Randomly sample 80% of rows per tree
+            colsample_bytree=0.8,  # Randomly sample 80% of features per tree
+            reg_alpha=1.0,  # L1 regularization
+            reg_lambda=1.0,  # L2 regularization
         )
 
-        self.xg_model.fit(X_train, y_train)
-        print("\nxg_model classes:", self.xg_model.n_classes_, self.xg_model.classes_)
+        final_xg_model.fit(X, y)
+
+        # 6. Save final production model locally
+        local_path = f"/tmp/{XGBMODEL_FILENAME}"
+        joblib.dump(final_xg_model, local_path)
+        print(f"Model successfully saved to {local_path}")
+
+         # 2. Upload to Google Cloud Storage
+        #storage_client = storage.Client()
+        #bucket = storage_client.bucket(BUCKET_NAME)
+        #blob_path = f"{DIRECTORY_NAME}/{MODEL_FILENAME}"
+        #blob = bucket.blob(blob_path)
+        #blob.upload_from_filename(local_path)
+        #print(f"Successfully uploaded model to gs://{blob_path}")
+
+        # 3. Notify App Engine to reload the model from GCS
+        try:
+            reload_endpoint = f"{APP_ENGINE_URL}/reload-model"
+            resp = requests.post(reload_endpoint, timeout=10)
+            print(f"App Engine notification status: {resp.status_code} - {resp.text}")
+        except Exception as e:
+            print(f"Failed to notify App Engine service: {e}")
 
         return True
 
-    def test(self):
-        # 1. Input
-        input = {
-            "Company": ["ICE", "MANH", "AAPL", "AMZN"],
-            "Close": [],
-            "Volume": [],
-            "targetMedianPrice": [],
-            "beta": [1.086, 1.444, 1.229],
-            "fiftyTwoWeekLow": [18.5, 22.1, 15.2],
-            "fiftyTwoWeekHigh": [2.5, 3.1, 1.8],
-            "shortRatio": [2.8, 3.3, 2.0],
-            "epsForward": [16.1, 19.5, 14.0],
-            "forwardPE": [4.2, 3.8, 4.5],
-            "pegRatio": [2.40, 1.83, 0.81],
-            "revenueGrowth": [0.166, 0.166, 0.331],
-            "dividendYield": [0.37, 0.00, 0.37],
-            "fiftyDayAverage": [290.1468, 256.997, 619.2546],
-            "averageAnalystRating_float": [2.0, 1.3, 1.3],
-        }
 
+    def init_runtime(self):
+        local_path = f"/tmp/{XGBMODEL_FILENAME}"
+        self.xg_model = joblib.load(local_path)
+        print("Model running:",  self.xg_model)
+
+        # 1. Get raw normalized importance scores
+        importances = self.xg_model.feature_importances_
+
+        # 2. Map scores to feature names in a clean DataFrame
+        feature_imp_df = pd.DataFrame({
+            'Feature': self.xg_model.feature_names_in_,
+            'Importance': importances
+        }).sort_values(by='Importance', ascending=False)
+
+        print(feature_imp_df)
+
+
+    def create_input(self, orgs):
+        # Check if current time is greater than 4 PM EST
         est_tz = timezone(timedelta(hours=-5))
         current_time = datetime.now(est_tz)
-        # Create a target time object for 4:00 PM today in EST
         target_time = datetime(
             current_time.year,
             current_time.month,
@@ -122,153 +389,150 @@ class ModelBuilder:
             tzinfo=est_tz,
         )
 
-        # Check if current time is greater than 4 PM EST
         if current_time > target_time:
-            test_date = date.today() - timedelta(days=1)
+            predict_date = target_time
         else:
-            test_date = date.today() - timedelta(days=2)
+            predict_date = target_time - timedelta(days=1)
+        if predict_date.weekday() in {5, 6, 0}:
+            weekendoffset =  4 - predict_date.weekday()
+            predict_date = target_time + timedelta(days=weekendoffset)
 
-        print("test_date", test_date)
-        orgs = ["AAPL", "AMZN", "MU"]
-        tickers = yf.Tickers(orgs)
+        print("predict_date:", predict_date)
+        price_df = yf.download(orgs, start=predict_date, end=predict_date, auto_adjust=True)
+        price_df = price_df.stack(level=1).reset_index()
+        price_df = price_df.sort_values('Date').reset_index(drop=True)
+        price_df['Date'] = pd.to_datetime(price_df['Date'])
+        print("price_df\n:",  price_df)
+
         metrics_df_list = []
-        # metrics_data = tickers.history(period=None,start=test_date, end=date.today())
-        # print("metrics_data:",metrics_data.columns,metrics_data)
         for org in orgs:
-            metrics_df_list.append(pd.DataFrame([tickers.tickers[org].info]).fillna(0))
+            ticker_obj = yf.Ticker(org)
+            #2 Financials
+            finacials_df = ticker_obj.get_financials(freq='quarterly')
+            finacials_df_x = self.transformFeatureXY(finacials_df, org)
 
-        current_metrics_df = pd.concat(metrics_df_list, ignore_index=True)
-        current_metrics_df.rename(
-            columns={"previousClose": "Close", "volume": "Volume"}, inplace=True
-        )
-        current_metrics_df["averageAnalystRating_float"] = pd.to_numeric(
-            current_metrics_df["averageAnalystRating"].str.split("-").str[0],
-            errors="coerce",
-        ).astype(float)
-        if "bhsScore" in self.training_columns:
-            self.training_columns.remove("bhsScore")
-        input_df = current_metrics_df[self.training_columns]
+            balancesheet = ticker_obj.get_balancesheet(freq='quarterly')
+            balancesheet_x = self.transformFeatureXY(balancesheet, org)
+            metrics_df = pd.merge(finacials_df_x, balancesheet_x, on=['Ticker','Date'], how='inner')
 
-        # 2. Load the data into a Pandas DataFrame
-        # input_df = pd.DataFrame(input)
-        # input_df = input_df.drop(columns=["Company"])
-        input_df.fillna(0, inplace=True)
+            cashflow = ticker_obj.get_cashflow(freq='quarterly')
+            cashflow_x = self.transformFeatureXY(cashflow, org)
+            metrics_df = pd.merge(metrics_df, cashflow_x, on=['Ticker','Date'], how='inner')
+
+            metrics_df = metrics_df.sort_values("Date").reset_index(drop=True)
+
+            actions = ticker_obj.get_actions(period="max").reset_index().rename(columns={'index': 'Date'})
+            actions['Ticker'] = org
+            actions['Date'] = pd.to_datetime(actions['Date']).dt.date
+            actions["Date"] = pd.to_datetime(actions["Date"])
+            actions = actions.sort_values('Date').reset_index(drop=True)
+
+            metrics_df = pd.merge_asof(metrics_df, actions, left_on='Date', right_on='Date', by='Ticker',
+                                       direction='backward')
+
+            price_targets = pd.DataFrame([ticker_obj.get_analyst_price_targets()])
+            price_targets['Ticker'] = org
+            price_targets['Date'] = datetime.now(timezone.utc).date()
+            price_targets["Date"] = pd.to_datetime(price_targets["Date"])
+            price_targets = price_targets.sort_values('Date')
+            metrics_df = pd.merge_asof(metrics_df, price_targets, left_on='Date', right_on='Date', by='Ticker',
+                                       direction='backward')
+            metrics_df_list.append(metrics_df)
+
+        metrics_df = pd.concat(metrics_df_list, ignore_index=True, sort=False)
+        #metrics_df['Date'] = pd.to_datetime(metrics_df['Date'])
+        metrics_df = metrics_df.sort_values('Date')
+
+        merged_df = pd.merge_asof(price_df, metrics_df, left_on='Date', right_on='Date',
+                                  by='Ticker', direction='backward')
+        zero_fill_cols = [
+            "ResearchAndDevelopment",
+            "InterestExpense",
+            "InterestIncome",
+            "TotalUnusualItems",
+            "Goodwill",
+            "Receivables",
+            "Inventory",
+            "NetPPE",
+            "StockBasedCompensation",
+            "CommonStockDividendPaid",
+            "RepurchaseOfCapitalStock",
+        ]
+        for col in zero_fill_cols:
+            if col in merged_df.columns:
+                merged_df[col] = merged_df[col].fillna(0)
+            else:
+                merged_df[col] = 0
+
+        merged_df.fillna(0, inplace=True)
+        feature_df = self.compute_financial_ratios(merged_df)
+        #feature_df.insert(0, "Close", merged_df["Close"])
+        feature_df["Close"] =  merged_df["Close"]
+        print("create_input final-df:\n",  feature_df)
+        input_columns = [col for col in self.training_columns if col != "bhsScore"]
+        return feature_df[input_columns]
+
+
+    def test_model(self):
+        # 1. Input
+        input = {
+            "Ticker": ["ICE", "MANH", "AMD"],
+            "Close": [],
+            "Price_To_Earnings": [],
+            "Price_To_FreeCashFlow": [],
+            "Price_To_Book": [1.086, 1.444, 1.229],
+            "EV_To_EBITDA": [18.5, 22.1, 15.2],
+            "Gross_Margin": [2.5, 3.1, 1.8],
+            "EBITDA_Margin": [2.8, 3.3, 2.0],
+            "FCF_Margin": [16.1, 19.5, 14.0],
+            "Return_On_Equity": [4.2, 3.8, 4.5],
+            "Return_On_Assets": [2.40, 1.83, 0.81],
+            "Debt_To_Equity": [0.166, 0.166, 0.331],
+            "Debt_To_Assets": [0.37, 0.00, 0.37],
+            "Working_Capital_Ratio": [290.1468, 256.997, 619.2546],
+            "Cash_To_Debt": [2.0, 1.3, 1.3],
+            "CFO_To_NetIncome": [2.0, 1.3, 1.3],
+            "SBC_To_Revenue": [2.0, 1.3, 1.3],
+            "CapEx_To_CFO": [2.0, 1.3, 1.3]
+        }
+
+        X_test, y_test = self.load_test_data()
+        #print(f"Test data:\n", X_test, y_test )
 
         # 3. Make Test predictions
-        y_pred = self.gb_model.predict(self.X_test)
-        predictions = [round(value) for value in y_pred]
-        # print(f"Test Input: {self.X_test}")
-        # print(f"Test y_test: {self.y_test}\n")
-        # print(f"Test Predictions: {predictions}\n")
-
-        accuracy = accuracy_score(self.y_test, predictions)
-        print("gb_model Accuracy: %.2f%%\n" % (accuracy * 100.0))
-
-        bhs_descs = ["Strong Sell", "Sell", "Hold", "Buy", "Strong Buy"]
-
-        # 4. Make Output predictions
-        # print(f"Input: {input_df}\n")
-        out_pred = self.gb_model.predict(input_df)
-        print(f"BHS out_pred: {out_pred}")
-        bhs_desc = [bhs_descs[value - 1] for value in out_pred]
-        print(f"BHS: {bhs_desc}")
-
-        # 5. Make Test predictions
-        y_pred = self.xg_model.predict(self.X_test)
+        y_pred = self.xg_model.predict(X_test)
         predictions = [round(value) for value in y_pred]
         # print(f"Test Predictions: {predictions}\n")
 
         le = LabelEncoder()
-        y_test_encoded = le.fit_transform(self.y_test)
+        y_test_encoded = le.fit_transform(y_test)
         accuracy = accuracy_score(y_test_encoded, predictions)
         print("xg_model Accuracy: %.2f%%\n" % (accuracy * 100.0))
 
-        # 6. Make Output predictions
+
+    def predict(self, input_df):
         out_pred = self.xg_model.predict(input_df) + 1
         print(f"BHS out_pred: {out_pred}")
-        bhs_desc = [bhs_descs[value] for value in out_pred]
+        bhs_desc = [self.bhs_descs[value] for value in out_pred]
         print(f"BHS: {bhs_desc}")
 
 
-class ModelTrainer:
-    def __init__(self):
-        self.training_columns = [
-            "bhsScore",
-            "Close",
-            "Volume",
-            "targetMedianPrice",
-            "beta",
-            "fiftyTwoWeekLow",
-            "fiftyTwoWeekHigh",
-            "shortRatio",
-            "epsForward",
-            "forwardPE",
-            "pegRatio",
-            "revenueGrowth",
-            "dividendYield",
-            "fiftyDayAverage",
-            "averageAnalystRating_float",
-        ]
-
-    def load_historical_data(self) -> pd.DataFrame:
-        """
-        Fetch your historical training data from BigQuery, Cloud Storage, or APIs.
-        """
-        print("Fetching historical training feature dataset...")
-        # Placeholder: Load from your data source
-        # feature_df = pd.read_parquet("gs://ainy-fin-data/historical_features.parquet")
-        return pd.DataFrame()
-
-    def train_and_export(self, feature_df: pd.DataFrame):
-        df = feature_df[self.training_columns].dropna()
-        X = df.drop(columns=["bhsScore"])
-        y = df["bhsScore"] - 1  # Shift 1-5 rating to 0-4 for XGBoost
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
-        )
-
-        print(f"Training XGBoost Model on {len(X_train)} samples...")
-        model = XGBClassifier(
-            n_estimators=100,
-            learning_rate=0.05,
-            max_depth=5,
-            objective="multi:softprob",
-        )
-        model.fit(X_train, y_train)
-
-        # 1. Save locally to ephemeral container storage
-        local_path = f"/tmp/{MODEL_FILENAME}"
-        joblib.dump(model, local_path)
-        print("Model saved locally.")
-
-        # 2. Upload to Google Cloud Storage
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(BUCKET_NAME)
-        blob = bucket.blob(MODEL_FILENAME)
-        blob.upload_from_filename(local_path)
-        print(f"Successfully uploaded model to gs://{BUCKET_NAME}/{MODEL_FILENAME}")
-
-        # 3. Notify App Engine to reload the model from GCS
-        try:
-            reload_endpoint = f"{APP_ENGINE_URL}/reload-model"
-            resp = requests.post(reload_endpoint, timeout=10)
-            print(f"App Engine notification status: {resp.status_code} - {resp.text}")
-        except Exception as e:
-            print(f"Failed to notify App Engine service: {e}")
-
-
-def main():
-    print(f"=== Starting Weekly Training Job Execution: {datetime.utcnow()} ===")
-    trainer = ModelTrainer()
-    feature_df = trainer.load_historical_data()
-
-    if not feature_df.empty:
-        trainer.train_and_export(feature_df)
+def main(args:list):
+    orgslist = args[0].split(",")
+    print(f"=== Starting Weekly Training Job Execution: {datetime.now(ZoneInfo('America/New_York')).date()} ===")
+    modelBuilder = ModelBuilder("xg",100)
+    #feature_df = modelBuilder.load_train_data()
+    #success = modelBuilder.train(feature_df)
+    success = True
+    if success == True:
         print("=== Training Job Completed Successfully ===")
+        modelBuilder.init_runtime()
+        modelBuilder.test_model()
+        input_df = modelBuilder.create_input(orgslist)
+        modelBuilder.predict(input_df)
     else:
-        print("Warning: Feature DataFrame was empty. Aborting training.")
+        print("Model Building failed")
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])
