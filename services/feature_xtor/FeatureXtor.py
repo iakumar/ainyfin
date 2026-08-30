@@ -13,7 +13,9 @@ class FeatureExtractor:
     DATA_DIR="/Users/rithuhegde/ainyfin/services/data"
     def __init__(self, usecase: str):
         self.usecase = usecase
-        self.symbols = ["ICE", "MANH", 'AMD', 'MSFT', 'GOOG', 'HOOD', 'TT', 'NET', 'ETN', 'PSX', 'EOG', 'GRMN', 'PANW']
+        self.symbols = ['ICE','MANH','AMD','GOOG','MSFT','HOOD','TT','NET','ETN','PSX','AAPL','NVDA',
+                        'EOG','GRMN','PANW','XOM','SNOW','TSLA','MRK','IQV','WFC','CBRE',
+                        'TMO','NFLX','INTU','MDLZ','Z','XYZ','AMZN','LRCX','GE','GS','PLTR']
         #self.symbols = [
         #    "ICE", "MANH", 'AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL', 'GOOG', 'META', 'LLY', 'AVGO',
         #    'JPM', 'TSLA', 'WMT', 'XOM', 'UNH', 'MA', 'PG', 'JNJ', 'COST', 'MRK',
@@ -27,7 +29,7 @@ class FeatureExtractor:
         #
         #
 
-        self.funds = ['CCMAZ', 'FBGRX', 'FELV', ]
+        self.funds = ['CCMAZ', 'FBGRX', 'FELV','AMLP', 'IWN' ]
         self.status = ''
 
 

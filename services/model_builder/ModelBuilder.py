@@ -73,7 +73,7 @@ class ModelBuilder:
         print("Fetching historical training feature dataset...")
         raw_df = pd.read_csv(ModelBuilder.DATA_DIR+'/ainyfina-input.csv')
         feature_df = self.compute_financial_ratios(raw_df).dropna()
-        feature_df[["bhsScore", "Close"]] = raw_df[["bhsScore", "Close"]].replace([np.inf, -np.inf], np.nan)
+        feature_df[['Ticker', "Close", "bhsScore"]] = raw_df[['Ticker', "Close", "bhsScore"]].replace([np.inf, -np.inf], np.nan)
         return feature_df
 
 
@@ -406,6 +406,7 @@ class ModelBuilder:
 
         metrics_df_list = []
         for org in orgs:
+            org = org.strip()
             ticker_obj = yf.Ticker(org)
             #2 Financials
             finacials_df = ticker_obj.get_financials(freq='quarterly')
@@ -415,7 +416,7 @@ class ModelBuilder:
             balancesheet_x = self.transformFeatureXY(balancesheet, org)
             metrics_df = pd.merge(finacials_df_x, balancesheet_x, on=['Ticker','Date'], how='inner')
 
-            cashflow = ticker_obj.get_cashflow(freq='quarterly')
+            cashflow:DataFrame = ticker_obj.get_cashflow(freq='quarterly')
             cashflow_x = self.transformFeatureXY(cashflow, org)
             metrics_df = pd.merge(metrics_df, cashflow_x, on=['Ticker','Date'], how='inner')
 
@@ -466,35 +467,16 @@ class ModelBuilder:
 
         merged_df.fillna(0, inplace=True)
         feature_df = self.compute_financial_ratios(merged_df)
-        #feature_df.insert(0, "Close", merged_df["Close"])
-        feature_df["Close"] =  merged_df["Close"]
+        feature_df[['Ticker', "Close"]] = merged_df[['Ticker', "Close"]].replace([np.inf, -np.inf], np.nan)
         print("create_input final-df:\n",  feature_df)
         input_columns = [col for col in self.training_columns if col != "bhsScore"]
+        #feature_df[input_columns + ['Ticker']].to_csv(ModelBuilder.DATA_DIR+'/testdata.csv')
         return feature_df[input_columns]
 
 
     def test_model(self):
         # 1. Input
-        input = {
-            "Ticker": ["ICE", "MANH", "AMD"],
-            "Close": [],
-            "Price_To_Earnings": [],
-            "Price_To_FreeCashFlow": [],
-            "Price_To_Book": [1.086, 1.444, 1.229],
-            "EV_To_EBITDA": [18.5, 22.1, 15.2],
-            "Gross_Margin": [2.5, 3.1, 1.8],
-            "EBITDA_Margin": [2.8, 3.3, 2.0],
-            "FCF_Margin": [16.1, 19.5, 14.0],
-            "Return_On_Equity": [4.2, 3.8, 4.5],
-            "Return_On_Assets": [2.40, 1.83, 0.81],
-            "Debt_To_Equity": [0.166, 0.166, 0.331],
-            "Debt_To_Assets": [0.37, 0.00, 0.37],
-            "Working_Capital_Ratio": [290.1468, 256.997, 619.2546],
-            "Cash_To_Debt": [2.0, 1.3, 1.3],
-            "CFO_To_NetIncome": [2.0, 1.3, 1.3],
-            "SBC_To_Revenue": [2.0, 1.3, 1.3],
-            "CapEx_To_CFO": [2.0, 1.3, 1.3]
-        }
+        input_df = pd.read_csv(ModelBuilder.DATA_DIR+'/testdata.csv')
 
         X_test, y_test = self.load_test_data()
         #print(f"Test data:\n", X_test, y_test )
@@ -510,15 +492,20 @@ class ModelBuilder:
         print("xg_model Accuracy: %.2f%%\n" % (accuracy * 100.0))
 
 
-    def predict(self, input_df):
-        out_pred = self.xg_model.predict(input_df) + 1
-        print(f"BHS out_pred: {out_pred}")
+    def predict(self, tickerlist, input_df):
+        out_pred = self.xg_model.predict(input_df)
         bhs_desc = [self.bhs_descs[value] for value in out_pred]
-        print(f"BHS: {bhs_desc}")
+        # Map ticker to description into a dict
+        ticker_bhs_map = dict(zip(tickerlist, bhs_desc))
+        print(f"BHS Predictions: {ticker_bhs_map}")
+
+        # Or print line-by-line
+        #for ticker, desc in zip(tickerlist, bhs_desc):
+        #  print(f"{ticker}: {desc}")
 
 
 def main(args:list):
-    orgslist = args[0].split(",")
+    tickerlist = args[0].split(",")
     print(f"=== Starting Weekly Training Job Execution: {datetime.now(ZoneInfo('America/New_York')).date()} ===")
     modelBuilder = ModelBuilder("xg",100)
     #feature_df = modelBuilder.load_train_data()
@@ -527,9 +514,9 @@ def main(args:list):
     if success == True:
         print("=== Training Job Completed Successfully ===")
         modelBuilder.init_runtime()
-        modelBuilder.test_model()
-        input_df = modelBuilder.create_input(orgslist)
-        modelBuilder.predict(input_df)
+        #modelBuilder.test_model()
+        input_df = modelBuilder.create_input(tickerlist)
+        modelBuilder.predict(tickerlist, input_df)
     else:
         print("Model Building failed")
 
