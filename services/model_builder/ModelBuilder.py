@@ -59,7 +59,27 @@ class ModelBuilder:
             "R_And_D_To_Revenue",
         ]
 
-        self.training_columns = self.ratio_columns +  ["Close", "bhsScore"]
+        # Collect trend feature columns for inf handling
+        self.trend_columns = [
+            "Revenue_YoY_Growth",
+            "Revenue_QoQ_Growth",
+            "EBITDA_YoY_Growth",
+            "EPS_YoY_Growth",
+            "FCF_YoY_Growth",
+            "Operating_CashFlow_YoY_Growth",
+            "Revenue_Acceleration",
+            "Gross_Margin_YoY_Delta",
+            "EBITDA_Margin_YoY_Delta",
+            "FCF_Margin_YoY_Delta",
+            "Operating_Margin_QoQ_Delta",
+            "Debt_YoY_Growth",
+            "Shares_Outstanding_YoY_Change",
+            "CapEx_YoY_Growth",
+            "ROIC_YoY_Delta",
+            "Working_Capital_YoY_Change",
+        ]
+
+        self.training_columns = self.ratio_columns + self.trend_columns + ["Close", "bhsScore"]
         print("training_columns:", self.training_columns)
         self.builder = builder
         self.n_estimators = n_estimators
@@ -72,12 +92,13 @@ class ModelBuilder:
         """
         print("Fetching historical training feature dataset...")
         raw_df = pd.read_csv(ModelBuilder.DATA_DIR+'/ainyfina-input.csv')
-        feature_df = self.compute_financial_ratios(raw_df).dropna()
-        feature_df[['Ticker', "Close", "bhsScore"]] = raw_df[['Ticker', "Close", "bhsScore"]].replace([np.inf, -np.inf], np.nan)
-        return feature_df
+        X = self.compute_financial_snapshot(raw_df).dropna()
+        X = self.compute_financial_trends(X).dropna()
+        X[['Ticker', "Close", "bhsScore"]] = raw_df[['Ticker', "Close", "bhsScore"]].replace([np.inf, -np.inf], np.nan)
+        return X
 
 
-    def compute_financial_ratios(self, df: pd.DataFrame) -> pd.DataFrame:
+    def compute_financial_snapshot(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Computes standardized valuation, leverage, profitability, and quality ratios
         from raw SEC fundamental and market price data.
@@ -94,26 +115,17 @@ class ModelBuilder:
         """
 
         # Define helper to prevent Division-by-Zero and np.inf errors
-        def safe_divide(
-            numerator: pd.Series, denominator: pd.Series
-        ) -> pd.Series:
-            return np.where(
-                (denominator == 0) | (denominator.isna()),
-                np.nan,
-                numerator / denominator,
-            )
+        def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+            return np.where((denominator == 0) | (denominator.isna()),
+                            np.nan, numerator / denominator)
 
         # Create a copy to prevent mutating the input DataFrame
         data = df.copy()
 
         # 1. Valuation Ratios
         data["Price_To_Earnings"] = safe_divide(data["Close"], data["DilutedEPS"])
-        data["Price_To_FreeCashFlow"] = safe_divide(
-            data["Close"] * data["DilutedAverageShares"], data["FreeCashFlow"]
-        )
-        data["Price_To_Book"] = safe_divide(
-            data["Close"] * data["DilutedAverageShares"], data["StockholdersEquity"]
-        )
+        data["Price_To_FreeCashFlow"] = safe_divide(data["Close"] * data["DilutedAverageShares"], data["FreeCashFlow"])
+        data["Price_To_Book"] = safe_divide(data["Close"] * data["DilutedAverageShares"], data["StockholdersEquity"])
         data["Price_To_Sales"] = safe_divide(
             data["Close"] * data["DilutedAverageShares"], data["TotalRevenue"]
         )
@@ -201,7 +213,92 @@ class ModelBuilder:
 
         # Clean extreme inf / -inf values on calculated ratio columns only
         data[self.ratio_columns] = data[self.ratio_columns].replace([np.inf, -np.inf], np.nan)
+        return data
 
+
+    def compute_financial_trends(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Computes quarterly YoY momentum, acceleration, and margin delta signals
+
+        from raw fundamental line items and calculated ratios.
+
+        Parameters:
+        -----------
+        df : pd.DataFrame
+            Must contain 'Ticker', 'Date', and normalized fundamental features/ratios
+            sorted chronologically by Ticker and Date.
+
+        Returns:
+        --------
+        pd.DataFrame
+            DataFrame augmented with fundamental trend features.
+        """
+        data = df.copy()
+
+        # Ensure dataset is sorted strictly by Ticker and Date
+        data = data.sort_values(["Ticker", "Date"]).reset_index(drop=True)
+
+        # Define vectorized safe percentage change helper
+        def safe_pct_change(series: pd.Series, periods: int) -> pd.Series:
+            prev = series.groupby(data["Ticker"]).shift(periods)
+            # Handle zero-division or sign-flips (e.g., negative to positive Net Income)
+            denom = prev.abs()
+            return (series - prev).divide(denom).where((denom != 0) & denom.notna(), np.nan)
+
+        # Define vectorized safe difference (delta) helper for margins/ratios
+        def safe_delta(series: pd.Series, periods: int) -> pd.Series:
+            prev = series.groupby(data["Ticker"]).shift(periods)
+            return series - prev
+
+        def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+            return np.where((denominator == 0) | (denominator.isna()),
+                            np.nan, numerator / denominator)
+
+        # -------------------------------------------------------------
+        # 1. Growth Velocity (YoY: 4 Quarters, QoQ: 1 Quarter)
+        # -------------------------------------------------------------
+        data["Revenue_YoY_Growth"] = safe_pct_change(data["TotalRevenue"], 4)
+        data["Revenue_QoQ_Growth"] = safe_pct_change(data["TotalRevenue"], 1)
+
+        data["EBITDA_YoY_Growth"] = safe_pct_change(data["NormalizedEBITDA"], 4)
+        data["EPS_YoY_Growth"] = safe_pct_change(data["DilutedEPS"], 4)
+        data["FCF_YoY_Growth"] = safe_pct_change(data["FreeCashFlow"], 4)
+        data["Operating_CashFlow_YoY_Growth"] = safe_pct_change(data["OperatingCashFlow"], 4)
+
+        # -------------------------------------------------------------
+        # 2. Fundamental Acceleration / Deceleration
+        # -------------------------------------------------------------
+        # Change in YoY growth rate (2nd Derivative of Revenue)
+        rev_growth_prev = data.groupby("Ticker")["Revenue_YoY_Growth"].shift(1)
+        data["Revenue_Acceleration"] = data["Revenue_YoY_Growth"] - rev_growth_prev
+
+        # -------------------------------------------------------------
+        # 3. Margin Expansion / Contraction (Basis Point Deltas)
+        # -------------------------------------------------------------
+        data["Gross_Margin_YoY_Delta"] = safe_delta(data["TotalRevenue"]-data["CostOfRevenue"], 4)
+        data["EBITDA_Margin"] = safe_divide(data["EBITDA"], data["TotalRevenue"])
+        data["EBITDA_Margin_YoY_Delta"] = safe_delta(data["EBITDA_Margin"], 4)
+        data["FCF_Margin"] = safe_divide(data["FreeCashFlow"], data["TotalRevenue"])
+        data["FCF_Margin_YoY_Delta"] = safe_delta(data["FCF_Margin"], 4)
+        data["Operating_Margin"] = safe_divide(data["OperatingIncome"], data["TotalRevenue"])
+        data["Operating_Margin_QoQ_Delta"] = safe_delta(data["Operating_Margin"], 1)
+
+        # -------------------------------------------------------------
+        # 4. Capital Structure & Reinvestment Velocity
+        # -------------------------------------------------------------
+        data["Debt_YoY_Growth"] = safe_pct_change(data["TotalDebt"], 4)
+        data["Shares_Outstanding_YoY_Change"] = safe_pct_change(data["DilutedAverageShares"], 4)
+        data["CapEx_YoY_Growth"] = safe_pct_change(data["CapitalExpenditure"].abs(), 4)
+
+        # -------------------------------------------------------------
+        # 5. Financial Health Trajectory Signals
+        # -------------------------------------------------------------
+        #
+        data["Return_On_Equity"] = safe_divide(data["NetIncome"], data["StockholdersEquity"])
+        data["ROIC_YoY_Delta"] = safe_delta(data["Return_On_Equity"], 4)
+        data["Working_Capital_YoY_Change"] = safe_pct_change(data["WorkingCapital"], 4)
+
+        # Clean extreme inf / -inf values generated by zero division
+        data[self.trend_columns] = data[self.trend_columns].replace([np.inf, -np.inf], np.nan)
         return data
 
 
@@ -372,7 +469,7 @@ class ModelBuilder:
             'Importance': importances
         }).sort_values(by='Importance', ascending=False)
 
-        print(feature_imp_df)
+        #print(feature_imp_df)
 
 
     def create_input(self, orgs):
@@ -415,7 +512,7 @@ class ModelBuilder:
         price_df = price_df.stack(level=1).reset_index()
         price_df = price_df.sort_values('Date').reset_index(drop=True)
         price_df['Date'] = pd.to_datetime(price_df['Date'])
-        #print("price_df\n:",  price_df)
+        print("price_df\n:",  price_df)
 
         metrics_df_list = []
         for org in orgs:
@@ -425,14 +522,17 @@ class ModelBuilder:
             #2 Financials
             finacials_df = ticker_obj.get_financials(freq='quarterly')
             finacials_df_x = self.transformFeatureXY(finacials_df, symbol)
+            #print("finacials_df_x:\n",  finacials_df_x)
 
             balancesheet = ticker_obj.get_balancesheet(freq='quarterly')
             balancesheet_x = self.transformFeatureXY(balancesheet, symbol)
             metrics_df = pd.merge(finacials_df_x, balancesheet_x, on=['Ticker','Date'], how='inner')
+            #print("metrics_df after balancesheet:\n",  metrics_df)
 
             cashflow:DataFrame = ticker_obj.get_cashflow(freq='quarterly')
             cashflow_x = self.transformFeatureXY(cashflow, symbol)
             metrics_df = pd.merge(metrics_df, cashflow_x, on=['Ticker','Date'], how='inner')
+            #print("metrics_df afrer cashflow:\n",  metrics_df)
 
             metrics_df = metrics_df.sort_values("Date").reset_index(drop=True)
 
@@ -444,6 +544,7 @@ class ModelBuilder:
 
             metrics_df = pd.merge_asof(metrics_df, actions, left_on='Date', right_on='Date', by='Ticker',
                                        direction='backward')
+            #print("metrics_df after actions:\n",  metrics_df)
 
             price_targets = pd.DataFrame([ticker_obj.get_analyst_price_targets()])
             price_targets['Ticker'] = symbol
@@ -452,6 +553,7 @@ class ModelBuilder:
             price_targets = price_targets.sort_values('Date')
             metrics_df = pd.merge_asof(metrics_df, price_targets, left_on='Date', right_on='Date', by='Ticker',
                                        direction='backward')
+            #print("metrics_df after price_targets:\n",  metrics_df)
             metrics_df_list.append(metrics_df)
 
         metrics_df = pd.concat(metrics_df_list, ignore_index=True, sort=False)
@@ -460,6 +562,8 @@ class ModelBuilder:
 
         merged_df = pd.merge_asof(price_df, metrics_df, left_on='Date', right_on='Date',
                                   by='Ticker', direction='backward')
+        print("metrics_df after price:\n",  merged_df)
+
         zero_fill_cols = [
             "ResearchAndDevelopment",
             "InterestExpense",
@@ -480,12 +584,17 @@ class ModelBuilder:
                 merged_df[col] = 0
 
         merged_df.fillna(0, inplace=True)
-        feature_df = self.compute_financial_ratios(merged_df)
+        feature_df = self.compute_financial_snapshot(merged_df)
         feature_df[['Ticker', "Close"]] = merged_df[['Ticker', "Close"]].replace([np.inf, -np.inf], np.nan)
-        print("create_input final-df:\n",  feature_df)
+        print("metrics_df after compute_financial_snapshot:\n",  feature_df)
+
+        merged_df = self.compute_financial_trends(metrics_df)
+        print("metrics_df after compute_financial_trends:\n",  merged_df)
+
+        print("create_input final-df:\n",  merged_df)
         input_columns = [col for col in self.training_columns if col != "bhsScore"]
         #feature_df[input_columns + ['Ticker']].to_csv(ModelBuilder.DATA_DIR+'/testdata.csv')
-        return feature_df[input_columns]
+        return merged_df[input_columns]
 
 
     def test_model(self):
