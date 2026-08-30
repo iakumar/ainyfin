@@ -1,12 +1,12 @@
-import sys
 import os
-import typing
-from datetime import date, datetime, timedelta, timezone
+import sys
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import joblib
 import numpy as np
 import pandas as pd
+from pandas.tseries.holiday import USFederalHolidayCalendar
 import requests
 import yfinance as yf
 from google.cloud import storage
@@ -323,7 +323,7 @@ class ModelBuilder:
         """
 
         final_xg_model = XGBClassifier(
-            n_estimators=50,
+            n_estimators=100,
             max_depth=3,  # Reduce depth from 5 to 3
             learning_rate=0.03,
             subsample=0.8,  # Randomly sample 80% of rows per tree
@@ -389,41 +389,55 @@ class ModelBuilder:
             tzinfo=est_tz,
         )
 
-        if current_time > target_time:
-            predict_date = target_time
-        else:
-            predict_date = target_time - timedelta(days=1)
-        if predict_date.weekday() in {5, 6, 0}:
-            weekendoffset =  4 - predict_date.weekday()
-            predict_date = target_time + timedelta(days=weekendoffset)
+        us_market_bday = pd.tseries.offsets.CustomBusinessDay(calendar=USFederalHolidayCalendar())
+        # Convert to pandas Timestamps to make calendar math work perfectly
+        current_ts = pd.Timestamp(current_time)
+        target_ts = pd.Timestamp(target_time)
 
-        print("predict_date:", predict_date)
+        # Rule 1: Weekends & Holidays (Sat/Sun/Holidays always roll backward to prior trading day)
+        if not us_market_bday.is_on_offset(target_ts):
+            predict_date = target_ts - us_market_bday
+
+        # Rule 2: It is Monday (or the first trading day of the week) and we haven't reached target_time yet
+        elif target_ts.weekday() == 0 and current_ts < target_ts:
+            predict_date = target_ts - (us_market_bday * 2) # Rolls back 2 trading days (e.g., past Friday to Thursday)
+
+        # Rule 3: target_time is in the past, and it is a valid weekday/trading day
+        elif current_ts > target_ts:
+            predict_date = target_ts
+
+        # Rule 4: Normal weekdays (Tue-Fri) where current_time hasn't reached target_time yet
+        else:
+            predict_date = target_ts - us_market_bday
+
+        print("predict_date:", predict_date, us_market_bday)
         price_df = yf.download(orgs, start=predict_date, end=predict_date, auto_adjust=True)
         price_df = price_df.stack(level=1).reset_index()
         price_df = price_df.sort_values('Date').reset_index(drop=True)
         price_df['Date'] = pd.to_datetime(price_df['Date'])
-        print("price_df\n:",  price_df)
+        #print("price_df\n:",  price_df)
 
         metrics_df_list = []
         for org in orgs:
-            org = org.strip()
-            ticker_obj = yf.Ticker(org)
+            symbol = org.strip()
+            print("Downloading financials for:",symbol)
+            ticker_obj = yf.Ticker(symbol)
             #2 Financials
             finacials_df = ticker_obj.get_financials(freq='quarterly')
-            finacials_df_x = self.transformFeatureXY(finacials_df, org)
+            finacials_df_x = self.transformFeatureXY(finacials_df, symbol)
 
             balancesheet = ticker_obj.get_balancesheet(freq='quarterly')
-            balancesheet_x = self.transformFeatureXY(balancesheet, org)
+            balancesheet_x = self.transformFeatureXY(balancesheet, symbol)
             metrics_df = pd.merge(finacials_df_x, balancesheet_x, on=['Ticker','Date'], how='inner')
 
             cashflow:DataFrame = ticker_obj.get_cashflow(freq='quarterly')
-            cashflow_x = self.transformFeatureXY(cashflow, org)
+            cashflow_x = self.transformFeatureXY(cashflow, symbol)
             metrics_df = pd.merge(metrics_df, cashflow_x, on=['Ticker','Date'], how='inner')
 
             metrics_df = metrics_df.sort_values("Date").reset_index(drop=True)
 
             actions = ticker_obj.get_actions(period="max").reset_index().rename(columns={'index': 'Date'})
-            actions['Ticker'] = org
+            actions['Ticker'] = symbol
             actions['Date'] = pd.to_datetime(actions['Date']).dt.date
             actions["Date"] = pd.to_datetime(actions["Date"])
             actions = actions.sort_values('Date').reset_index(drop=True)
@@ -432,7 +446,7 @@ class ModelBuilder:
                                        direction='backward')
 
             price_targets = pd.DataFrame([ticker_obj.get_analyst_price_targets()])
-            price_targets['Ticker'] = org
+            price_targets['Ticker'] = symbol
             price_targets['Date'] = datetime.now(timezone.utc).date()
             price_targets["Date"] = pd.to_datetime(price_targets["Date"])
             price_targets = price_targets.sort_values('Date')
@@ -505,7 +519,11 @@ class ModelBuilder:
 
 
 def main(args:list):
-    tickerlist = args[0].split(",")
+    if len(args) < 1:
+        print("Ticker list needed")
+        return
+
+    tickerlist = [ticker.strip() for ticker in args[0].split(",")]
     print(f"=== Starting Weekly Training Job Execution: {datetime.now(ZoneInfo('America/New_York')).date()} ===")
     modelBuilder = ModelBuilder("xg",100)
     #feature_df = modelBuilder.load_train_data()
