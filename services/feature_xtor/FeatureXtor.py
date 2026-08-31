@@ -94,7 +94,6 @@ class FeatureExtractor:
         # Phase 1: Outer Union (Combines all unique columns across stocks)
         # -------------------------------------------------------------
         unified_df = pd.concat(raw_dfs, axis=0, ignore_index=True, join="outer")
-        unified_df.to_csv(FeatureExtractor.DATA_DIR+'/finacials-u.csv', index=False, header=True)
 
         # Sort deterministically
         unified_df = unified_df.sort_values(["Ticker", "Date"]).reset_index(drop=True)

@@ -38,10 +38,10 @@ class ModelBuilder:
             "EV_To_EBITDA",
             "EV_To_EBIT",
             "Gross_Margin",
-            "Operating_Margin",
-            "EBITDA_Margin",
             "Net_Margin",
             "FCF_Margin",
+            "Operating_Margin",
+            "EBITDA_Margin",
             "Return_On_Equity",
             "Return_On_Assets",
             "Debt_To_Equity",
@@ -79,11 +79,54 @@ class ModelBuilder:
             "Working_Capital_YoY_Change",
         ]
 
-        self.training_columns = self.ratio_columns + self.trend_columns + ["Close", "bhsScore"]
-        print("training_columns:", self.training_columns)
+        self.training_columns = self.ratio_columns + self.trend_columns + ["bhsScore"]
+        #print("training_columns:", self.training_columns)
         self.builder = builder
         self.n_estimators = n_estimators
         self.xg_model = None
+
+
+    def getMostRecentMarketDate(self):
+        # Check if current time is greater than 4 PM EST
+        est_tz = timezone(timedelta(hours=-4))
+        current_time = datetime.now().astimezone()
+        target_time = datetime(
+            current_time.year,
+            current_time.month,
+            current_time.day,
+            17,
+            0,
+            0,
+            tzinfo=est_tz,
+        )
+
+        us_market_bday = pd.tseries.offsets.CustomBusinessDay(calendar=USFederalHolidayCalendar())
+        print("us_market_bday:",us_market_bday)
+        # Convert to pandas Timestamps to make calendar math work perfectly
+        current_ts = pd.Timestamp(current_time)
+        target_ts = pd.Timestamp(target_time)
+
+        # Rule 1: Weekends & Holidays (Sat/Sun/Holidays always roll backward to prior trading day)
+        if not us_market_bday.is_on_offset(target_ts):
+            predict_date = target_ts - us_market_bday
+
+        # Rule 2: It is Monday (or the first trading day of the week) and we haven't reached target_time yet
+        elif target_ts.weekday() == 0 and current_ts < target_ts:
+            predict_date = target_ts - us_market_bday # Rolls back 2 trading days (e.g., past Friday to Thursday)
+            print("predict_date 2:", predict_date, current_ts, target_ts)
+
+        # Rule 3: target_time is in the past, and it is a valid weekday/trading day
+        elif current_ts > target_ts:
+            predict_date = target_ts
+            print("predict_date 3:", predict_date)
+
+        # Rule 4: Normal weekdays (Tue-Fri) where current_time hasn't reached target_time yet
+        else:
+            predict_date = target_ts - us_market_bday
+            print("predict_date 4:", predict_date)
+
+        predict_date_end = predict_date + timedelta(days=1)
+        return predict_date, predict_date_end
 
 
     def load_train_data(self) -> pd.DataFrame:
@@ -92,10 +135,26 @@ class ModelBuilder:
         """
         print("Fetching historical training feature dataset...")
         raw_df = pd.read_csv(ModelBuilder.DATA_DIR+'/ainyfina-input.csv')
-        X = self.compute_financial_snapshot(raw_df).dropna()
-        X = self.compute_financial_trends(X).dropna()
-        X[['Ticker', "Close", "bhsScore"]] = raw_df[['Ticker', "Close", "bhsScore"]].replace([np.inf, -np.inf], np.nan)
-        return X
+        raw_df = raw_df.sort_values(['Ticker','Date'])
+        snapshot_df = self.compute_financial_snapshot(raw_df)
+        snapshot_df.to_csv(ModelBuilder.DATA_DIR+'/snapshot.csv')
+        snapshot_df[['Ticker', "bhsScore"]] = raw_df[['Ticker', "bhsScore"]].replace([np.inf, -np.inf], np.nan)
+        snapshot_df['Date'] = pd.to_datetime(snapshot_df['Date'])
+        snapshot_df = snapshot_df.sort_values(['Date']).reset_index(drop=True)
+
+        finacials_df = pd.read_csv(ModelBuilder.DATA_DIR+'/finacials.csv')
+        balancesheet_df = pd.read_csv(ModelBuilder.DATA_DIR+'/balancesheet.csv')
+        quarterly_df = pd.merge(finacials_df, balancesheet_df, on=['Ticker','Date'], how='inner')
+        cashflow_df = pd.read_csv(ModelBuilder.DATA_DIR+'/cashflow.csv')
+        quarterly_df = pd.merge(quarterly_df, cashflow_df, on=['Ticker','Date'], how='inner')
+        quarterly_df['Date'] = pd.to_datetime(quarterly_df['Date'])
+        quarterly_df = quarterly_df.sort_values(['Ticker','Date']).reset_index(drop=True)
+        quarterly_df = self.compute_financial_trends(quarterly_df)
+        quarterly_df = quarterly_df.sort_values(['Date']).reset_index(drop=True)
+
+        merged_df = pd.merge_asof(snapshot_df, quarterly_df, left_on='Date', right_on='Date',
+                                  by='Ticker', direction='backward', suffixes=('', '_Trends'))
+        return merged_df
 
 
     def compute_financial_snapshot(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -106,7 +165,7 @@ class ModelBuilder:
         Parameters:
         -----------
         df : pd.DataFrame
-            Must contain raw fundamental columns and 'Close' market price.
+            Must contain raw fundamental columns market price.
 
         Returns:
         --------
@@ -126,9 +185,7 @@ class ModelBuilder:
         data["Price_To_Earnings"] = safe_divide(data["Close"], data["DilutedEPS"])
         data["Price_To_FreeCashFlow"] = safe_divide(data["Close"] * data["DilutedAverageShares"], data["FreeCashFlow"])
         data["Price_To_Book"] = safe_divide(data["Close"] * data["DilutedAverageShares"], data["StockholdersEquity"])
-        data["Price_To_Sales"] = safe_divide(
-            data["Close"] * data["DilutedAverageShares"], data["TotalRevenue"]
-        )
+        data["Price_To_Sales"] = safe_divide(data["Close"] * data["DilutedAverageShares"], data["TotalRevenue"])
         data["EV_To_EBITDA"] = safe_divide(
             (data["Close"] * data["DilutedAverageShares"])
             + data["TotalDebt"]
@@ -143,73 +200,37 @@ class ModelBuilder:
         )
 
         # 2. Profitability & Margins
-        data["Gross_Margin"] = safe_divide(
-            data["GrossProfit"], data["OperatingRevenue"]
-        )
-        data["Operating_Margin"] = safe_divide(
-            data["OperatingIncome"], data["TotalRevenue"]
-        )
-        data["EBITDA_Margin"] = safe_divide(
-            data["NormalizedEBITDA"], data["TotalRevenue"]
-        )
-        data["Net_Margin"] = safe_divide(
-            data["NetIncome"], data["TotalRevenue"]
-        )
-        data["FCF_Margin"] = safe_divide(
-            data["FreeCashFlow"], data["TotalRevenue"]
-        )
-        data["Return_On_Equity"] = safe_divide(
-            data["NetIncomeCommonStockholders"], data["CommonStockEquity"]
-        )
-        data["Return_On_Assets"] = safe_divide(
-            data["NetIncome"], data["TotalAssets"]
-        )
+        data["Gross_Margin"] = safe_divide(data["GrossProfit"], data["OperatingRevenue"])
+        data["Operating_Margin"] = safe_divide(data["OperatingIncome"], data["TotalRevenue"])
+        data["EBITDA_Margin"] = safe_divide(data["NormalizedEBITDA"], data["TotalRevenue"])
+        data["Net_Margin"] = safe_divide(data["NetIncome"], data["TotalRevenue"])
+        data["FCF_Margin"] = safe_divide(data["FreeCashFlow"], data["TotalRevenue"])
+        data["Return_On_Equity"] = safe_divide(data["NetIncomeCommonStockholders"], data["CommonStockEquity"])
+        data["Return_On_Assets"] = safe_divide(data["NetIncome"], data["TotalAssets"])
 
         # 3. Leverage, Solvency & Liquidity
-        data["Debt_To_Equity"] = safe_divide(
-            data["TotalDebt"], data["StockholdersEquity"]
-        )
-        data["Debt_To_Assets"] = safe_divide(
-            data["TotalDebt"], data["TotalAssets"]
-        )
-        data["Current_Ratio"] = safe_divide(
-            data["CurrentAssets"], data["CurrentLiabilities"]
-        )
+        data["Debt_To_Equity"] = safe_divide(data["TotalDebt"], data["StockholdersEquity"])
+        data["Debt_To_Assets"] = safe_divide(data["TotalDebt"], data["TotalAssets"])
+        data["Current_Ratio"] = safe_divide(data["CurrentAssets"], data["CurrentLiabilities"])
         data["Quick_Ratio"] = safe_divide(
             data["CashCashEquivalentsAndShortTermInvestments"] + data["AccountsReceivable"],
             data["CurrentLiabilities"],
         )
-        data["Interest_Coverage"] = safe_divide(
-            data["EBIT"], data["InterestExpense"].abs()
-        )
+        data["Interest_Coverage"] = safe_divide(data["EBIT"], data["InterestExpense"].abs())
         data["Cash_To_Debt"] = safe_divide(
             data["CashCashEquivalentsAndShortTermInvestments"], data["TotalDebt"]
         )
 
         # 4. Operational Efficiency
-        data["Asset_Turnover"] = safe_divide(
-            data["TotalRevenue"], data["TotalAssets"]
-        )
-        data["Working_Capital_Turnover"] = safe_divide(
-            data["TotalRevenue"], data["WorkingCapital"]
-        )
+        data["Asset_Turnover"] = safe_divide(data["TotalRevenue"], data["TotalAssets"])
+        data["Working_Capital_Turnover"] = safe_divide(data["TotalRevenue"], data["WorkingCapital"])
 
         # 5. Earnings Quality & Capital Allocation
-        data["CFO_To_NetIncome"] = safe_divide(
-            data["OperatingCashFlow"], data["NetIncome"]
-        )
-        data["SBC_To_Revenue"] = safe_divide(
-            data["StockBasedCompensation"], data["TotalRevenue"]
-        )
-        data["CapEx_To_CFO"] = safe_divide(
-            data["CapitalExpenditure"].abs(), data["OperatingCashFlow"]
-        )
-        data["CapEx_To_Revenue"] = safe_divide(
-            data["CapitalExpenditure"].abs(), data["TotalRevenue"]
-        )
-        data["R_And_D_To_Revenue"] = safe_divide(
-            data["ResearchAndDevelopment"], data["TotalRevenue"]
-        )
+        data["CFO_To_NetIncome"] = safe_divide(data["OperatingCashFlow"], data["NetIncome"])
+        data["SBC_To_Revenue"] = safe_divide(data["StockBasedCompensation"], data["TotalRevenue"])
+        data["CapEx_To_CFO"] = safe_divide(data["CapitalExpenditure"].abs(), data["OperatingCashFlow"])
+        data["CapEx_To_Revenue"] = safe_divide(data["CapitalExpenditure"].abs(), data["TotalRevenue"])
+        data["R_And_D_To_Revenue"] = safe_divide(data["ResearchAndDevelopment"], data["TotalRevenue"])
 
         # Clean extreme inf / -inf values on calculated ratio columns only
         data[self.ratio_columns] = data[self.ratio_columns].replace([np.inf, -np.inf], np.nan)
@@ -256,9 +277,7 @@ class ModelBuilder:
         # -------------------------------------------------------------
         # 1. Growth Velocity (YoY: 4 Quarters, QoQ: 1 Quarter)
         # -------------------------------------------------------------
-        data["Revenue_YoY_Growth"] = safe_pct_change(data["TotalRevenue"], 4)
         data["Revenue_QoQ_Growth"] = safe_pct_change(data["TotalRevenue"], 1)
-
         data["EBITDA_YoY_Growth"] = safe_pct_change(data["NormalizedEBITDA"], 4)
         data["EPS_YoY_Growth"] = safe_pct_change(data["DilutedEPS"], 4)
         data["FCF_YoY_Growth"] = safe_pct_change(data["FreeCashFlow"], 4)
@@ -268,8 +287,20 @@ class ModelBuilder:
         # 2. Fundamental Acceleration / Deceleration
         # -------------------------------------------------------------
         # Change in YoY growth rate (2nd Derivative of Revenue)
-        rev_growth_prev = data.groupby("Ticker")["Revenue_YoY_Growth"].shift(1)
-        data["Revenue_Acceleration"] = data["Revenue_YoY_Growth"] - rev_growth_prev
+        # 2. Compute Acceleration as QoQ change in YoY growth rate
+        data["Revenue_YoY_Growth"] = data.groupby("Ticker")["TotalRevenue"].pct_change(
+            4, fill_method=None
+        )
+        print("data['Revenue_YoY_Growth']", data["Revenue_YoY_Growth"].head(100))
+        data["Revenue_Acceleration"] = data.groupby("Ticker")["Revenue_YoY_Growth"].diff(1)
+        data["Revenue_Acceleration"] = data["Revenue_Acceleration"].clip(lower=-1.0, upper=1.0)
+        accel = data["Revenue_Acceleration"]
+        print("accel:", data["Revenue_YoY_Growth"], data.groupby("Ticker"), accel)
+        print("Missing count:", accel.isna().sum())
+        print("Infinite count:", np.isinf(accel).sum())
+        print("Unique values:", accel.nunique())
+        print("Standard dev:", accel.std())
+
 
         # -------------------------------------------------------------
         # 3. Margin Expansion / Contraction (Basis Point Deltas)
@@ -293,7 +324,7 @@ class ModelBuilder:
         # 5. Financial Health Trajectory Signals
         # -------------------------------------------------------------
         #
-        data["Return_On_Equity"] = safe_divide(data["NetIncome"], data["StockholdersEquity"])
+        data["Return_On_Equity"] = safe_divide(data["NetIncomeCommonStockholders"], data["CommonStockEquity"])
         data["ROIC_YoY_Delta"] = safe_delta(data["Return_On_Equity"], 4)
         data["Working_Capital_YoY_Change"] = safe_pct_change(data["WorkingCapital"], 4)
 
@@ -313,7 +344,7 @@ class ModelBuilder:
 
 
     def load_test_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-        feature_df = self.load_train_data()[self.training_columns].dropna()
+        feature_df = self.load_train_data()[self.training_columns]
         # print(self.target_column,":", feature_df[self.target_column])
         # print("feature_df:", df.shape, feature_df.columns)
 
@@ -328,10 +359,10 @@ class ModelBuilder:
 
 
     def train(self, feature_df):
-        df = feature_df[self.training_columns].dropna()
+        df = feature_df[self.training_columns]
 
         # 1. Separate features and target
-        X = df.drop(columns=[self.target_column]).dropna()
+        X = df.drop(columns=[self.target_column])
         y = df[self.target_column] - 1  # Shift 1-3 rating to 0-3 for XGBoost
 
         n_splits: int = 5
@@ -342,7 +373,6 @@ class ModelBuilder:
         cv_f1_scores = []
 
         print(f"\n=== Starting {n_splits}-Fold Stratified Cross-Validation ===")
-
         print("final_df y_train:", feature_df[self.target_column].unique())
 
         # 3. Iterate through folds
@@ -380,8 +410,6 @@ class ModelBuilder:
             # Predict on validation fold
             val_preds = fold_model.predict(X_val_fold)
             oof_predictions[val_idx] = val_preds
-            bhs_desc = [self.bhs_descs[value] for value in val_preds]
-            print(f"BHS: {bhs_desc}")
 
             # Metric evaluation
             fold_acc = accuracy_score(y_val_fold, val_preds)
@@ -468,51 +496,13 @@ class ModelBuilder:
             'Feature': self.xg_model.feature_names_in_,
             'Importance': importances
         }).sort_values(by='Importance', ascending=False)
-
-        #print(feature_imp_df)
+        print(feature_imp_df)
 
 
     def create_input(self, orgs):
-        # Check if current time is greater than 4 PM EST
-        est_tz = timezone(timedelta(hours=-5))
-        current_time = datetime.now(est_tz)
-        target_time = datetime(
-            current_time.year,
-            current_time.month,
-            current_time.day,
-            16,
-            0,
-            0,
-            tzinfo=est_tz,
-        )
-
-        us_market_bday = pd.tseries.offsets.CustomBusinessDay(calendar=USFederalHolidayCalendar())
-        # Convert to pandas Timestamps to make calendar math work perfectly
-        current_ts = pd.Timestamp(current_time)
-        target_ts = pd.Timestamp(target_time)
-
-        # Rule 1: Weekends & Holidays (Sat/Sun/Holidays always roll backward to prior trading day)
-        if not us_market_bday.is_on_offset(target_ts):
-            predict_date = target_ts - us_market_bday
-
-        # Rule 2: It is Monday (or the first trading day of the week) and we haven't reached target_time yet
-        elif target_ts.weekday() == 0 and current_ts < target_ts:
-            predict_date = target_ts - (us_market_bday * 2) # Rolls back 2 trading days (e.g., past Friday to Thursday)
-
-        # Rule 3: target_time is in the past, and it is a valid weekday/trading day
-        elif current_ts > target_ts:
-            predict_date = target_ts
-
-        # Rule 4: Normal weekdays (Tue-Fri) where current_time hasn't reached target_time yet
-        else:
-            predict_date = target_ts - us_market_bday
-
-        print("predict_date:", predict_date, us_market_bday)
-        price_df = yf.download(orgs, start=predict_date, end=predict_date, auto_adjust=True)
-        price_df = price_df.stack(level=1).reset_index()
-        price_df = price_df.sort_values('Date').reset_index(drop=True)
+        price_df = yf.download(orgs, period="1d").stack(level=1).reset_index()
         price_df['Date'] = pd.to_datetime(price_df['Date'])
-        print("price_df\n:",  price_df)
+        price_df = price_df.sort_values(['Date']).reset_index(drop=True)
 
         metrics_df_list = []
         for org in orgs:
@@ -559,10 +549,13 @@ class ModelBuilder:
         metrics_df = pd.concat(metrics_df_list, ignore_index=True, sort=False)
         #metrics_df['Date'] = pd.to_datetime(metrics_df['Date'])
         metrics_df = metrics_df.sort_values('Date')
+        metrics_df = self.compute_financial_trends(metrics_df)
+        #print("metrics_df after compute_financial_trends:\n",  metrics_df)
 
+        metrics_df = metrics_df.sort_values(['Date'])
         merged_df = pd.merge_asof(price_df, metrics_df, left_on='Date', right_on='Date',
                                   by='Ticker', direction='backward')
-        print("metrics_df after price:\n",  merged_df)
+        #print("metrics_df after price:\n",  merged_df)
 
         zero_fill_cols = [
             "ResearchAndDevelopment",
@@ -583,17 +576,13 @@ class ModelBuilder:
             else:
                 merged_df[col] = 0
 
+        merged_df = self.compute_financial_snapshot(merged_df)
+        #print("metrics_df after compute_financial_snapshot:\n",  merged_df)
+
         merged_df.fillna(0, inplace=True)
-        feature_df = self.compute_financial_snapshot(merged_df)
-        feature_df[['Ticker', "Close"]] = merged_df[['Ticker', "Close"]].replace([np.inf, -np.inf], np.nan)
-        print("metrics_df after compute_financial_snapshot:\n",  feature_df)
-
-        merged_df = self.compute_financial_trends(metrics_df)
-        print("metrics_df after compute_financial_trends:\n",  merged_df)
-
         print("create_input final-df:\n",  merged_df)
         input_columns = [col for col in self.training_columns if col != "bhsScore"]
-        #feature_df[input_columns + ['Ticker']].to_csv(ModelBuilder.DATA_DIR+'/testdata.csv')
+        merged_df[input_columns + ['Ticker']].to_csv(ModelBuilder.DATA_DIR+'/testdata.csv')
         return merged_df[input_columns]
 
 
@@ -632,7 +621,6 @@ def main(args:list):
         print("Ticker list needed")
         return
 
-    tickerlist = [ticker.strip() for ticker in args[0].split(",")]
     print(f"=== Starting Weekly Training Job Execution: {datetime.now(ZoneInfo('America/New_York')).date()} ===")
     modelBuilder = ModelBuilder("xg",100)
     #feature_df = modelBuilder.load_train_data()
@@ -641,7 +629,8 @@ def main(args:list):
     if success == True:
         print("=== Training Job Completed Successfully ===")
         modelBuilder.init_runtime()
-        #modelBuilder.test_model()
+        modelBuilder.test_model()
+        tickerlist = [ticker.strip() for ticker in args[0].split(",")]
         input_df = modelBuilder.create_input(tickerlist)
         modelBuilder.predict(tickerlist, input_df)
     else:
