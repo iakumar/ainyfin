@@ -6,8 +6,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from .EdgarXDI import EdgarXDI
 
-@final
 class FeatureExtractor:
 
     DATA_DIR="/Users/rithuhegde/ainyfin/services/data"
@@ -27,7 +27,6 @@ class FeatureExtractor:
         # WFC, CBRE, TMO, NFLX, INTU, MDLZ, Z, XYZ, GE, GS, AMZN, LRCX, GE, GS, PLTR,
         #]
         #
-        #
 
         self.funds = ['CCMAZ', 'FBGRX', 'FELV','AMLP', 'IWN' ]
         self.status = ''
@@ -41,14 +40,15 @@ class FeatureExtractor:
         start_date = today - timedelta(days=(training_window+look_ahead))
         end_date = today - timedelta(days= look_ahead)
 
-        """
+
         #2 Price
         price_df = yf.download(self.symbols, start=start_date, end=end_date, auto_adjust=True)
         price_df = price_df.stack(level=1).reset_index()
         price_df = price_df.sort_values('Date').reset_index(drop=True)
         price_df["TargetDate"] = price_df["Date"] + pd.to_timedelta(look_ahead+1, unit='D')
-        price_df.to_csv(FeatureExtractor.DATA_DIR+'/price.csv')
+        price_df.to_csv(self.DATA_DIR+'/price.csv')
 
+        """
         #2 Financials
         self.downloadFinancials(start_date=start_date, end_date=end_date)
 
@@ -57,10 +57,13 @@ class FeatureExtractor:
 
         #4 cashflow
         self.downloadCashflow(start_date=start_date, end_date=end_date)
-        """
 
         #5 misc
         self.downloadMisc(start_date=start_date, end_date=end_date)
+        """
+
+        edgarXDI = EdgarXDI("BHS")
+        edgarXDI.downloadFinancialData(self.symbols)
 
         self.status = 'Done'
 
@@ -104,16 +107,16 @@ class FeatureExtractor:
 
         # Core standardized line items shared across most companies
         core_features = [
-            "TotalRevenue",
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
             "OperatingRevenue",
-            "CostOfRevenue",
+            "CostOfGoodsAndServicesSold",
             "GrossProfit",
             "OperatingExpense",
             "ResearchAndDevelopment",
             "SellingGeneralAndAdministration",
             "SellingAndMarketingExpense",
             "GeneralAndAdministrativeExpense",
-            "OperatingIncome",
+            "OperatingIncomeLoss",
             "EBITDA",
             "NormalizedEBITDA",
             "EBIT",
@@ -124,13 +127,13 @@ class FeatureExtractor:
             "TaxProvision",
             "TaxRateForCalcs",
             "NetIncome",
-            "NetIncomeCommonStockholders",
+            "NetIncomeLoss",
             "NetIncomeContinuousOperations",
             "DilutedNIAvailtoComStockholders",
             "BasicEPS",
-            "DilutedEPS",
+            "EarningsPerShareDiluted",
             "BasicAverageShares",
-            "DilutedAverageShares",
+            "WeightedAverageNumberOfDilutedSharesOutstanding",
         ]
 
         # Ensure all core columns exist (add as NaN if completely missing from batch)
@@ -150,9 +153,9 @@ class FeatureExtractor:
                 unified_df[col] = unified_df[col].fillna(0)
 
         # Calculate resilient fallback metrics if primary metrics are missing
-        if "GrossProfit" in unified_df.columns and "TotalRevenue" in unified_df.columns:
+        if "GrossProfit" in unified_df.columns and "RevenueFromContractWithCustomerExcludingAssessedTax" in unified_df.columns:
             unified_df["GrossProfit"] = unified_df["GrossProfit"].fillna(
-                unified_df["TotalRevenue"] - unified_df.get("CostOfRevenue", 0)
+                unified_df["RevenueFromContractWithCustomerExcludingAssessedTax"] - unified_df.get("CostOfGoodsAndServicesSold", 0)
             )
 
         # Keep metadata + core features (or retain all columns if preferred)
@@ -160,7 +163,7 @@ class FeatureExtractor:
             c for c in core_features if c in unified_df.columns
         ]
         normalized_df = unified_df[final_cols]
-        normalized_df.to_csv(FeatureExtractor.DATA_DIR+'/finacials.csv', index=False, header=True)
+        normalized_df.to_csv(self.DATA_DIR+'/financials.csv', index=False, header=True)
 
 
     def downloadBalancesheet(self, start_date, end_date):
@@ -216,7 +219,7 @@ class FeatureExtractor:
             "LongTermDebt",
             "TotalDebt",  # CurrentDebt + LongTermDebt
             "StockholdersEquity",
-            "CommonStockEquity",
+            "StockholdersEquity",
             "RetainedEarnings",
             "WorkingCapital",
         ]
@@ -248,7 +251,7 @@ class FeatureExtractor:
             c for c in core_features if c in unified_df.columns
         ]
         normalized_df = unified_df[final_cols].copy()
-        normalized_df.to_csv(FeatureExtractor.DATA_DIR+'/balancesheet.csv', index=False, header=True)
+        normalized_df.to_csv(self.DATA_DIR+'/balancesheet.csv', index=False, header=True)
 
 
     def downloadCashflow(self, start_date, end_date):
@@ -284,11 +287,11 @@ class FeatureExtractor:
 
         # Core standardized line items shared across most companies
         core_features = [
-            "OperatingCashFlow",
+            "NetCashProvidedByUsedInOperatingActivities",
             "InvestingCashFlow",
             "FinancingCashFlow",
-            "CapitalExpenditure",
-            "FreeCashFlow",  # OperatingCashFlow - CapitalExpenditure
+            "PaymentsToAcquirePropertyPlantAndEquipment",
+            "FreeCashFlow",  # NetCashProvidedByUsedInOperatingActivities - PaymentsToAcquirePropertyPlantAndEquipment
             "StockBasedCompensation",
             "DepreciationAndAmortization",
             "RepurchaseOfCapitalStock",
@@ -315,8 +318,8 @@ class FeatureExtractor:
         # Calculate resilient fallback metrics if primary metrics are missing
         if "FreeCashFlow" in unified_df.columns:
             unified_df["FreeCashFlow"] = unified_df["FreeCashFlow"].fillna(
-                unified_df.get("OperatingCashFlow", 0.0)
-                - np.abs(unified_df.get("CapitalExpenditure", 0.0))
+                unified_df.get("NetCashProvidedByUsedInOperatingActivities", 0.0)
+                - np.abs(unified_df.get("PaymentsToAcquirePropertyPlantAndEquipment", 0.0))
             )
 
         # Keep metadata + core features (or retain all columns if preferred)
@@ -324,7 +327,7 @@ class FeatureExtractor:
             c for c in core_features if c in unified_df.columns
         ]
         normalized_df = unified_df[final_cols].copy()
-        normalized_df.to_csv(FeatureExtractor.DATA_DIR+'/cashflow.csv', index=False, header=True)
+        normalized_df.to_csv(self.DATA_DIR+'/cashflow.csv', index=False, header=True)
 
 
     def downloadMisc(self, start_date, end_date):
@@ -341,12 +344,12 @@ class FeatureExtractor:
             actions = actions[
                 (actions["Date"] >= start_date) & (actions["Date"] <= end_date)
             ]
-            actions.to_csv(FeatureExtractor.DATA_DIR+'/actions.csv', mode=mode, index=False, header=write_header)
+            actions.to_csv(self.DATA_DIR+'/actions.csv', mode=mode, index=False, header=write_header)
 
             price_targets = pd.DataFrame([ticker_obj.get_analyst_price_targets()])
             price_targets['Ticker'] = symbol
             price_targets['Date'] = datetime.now(timezone.utc).date()
-            price_targets.to_csv(FeatureExtractor.DATA_DIR+'/price_targets.csv',mode=mode, index=False, header=write_header)
+            price_targets.to_csv(self.DATA_DIR+'/price_targets.csv',mode=mode, index=False, header=write_header)
 
             write_header = False
             mode = "a"
@@ -363,7 +366,7 @@ class FeatureExtractor:
 
 
     def load(self):
-        price_df = pd.read_csv(FeatureExtractor.DATA_DIR+'/price.csv')
+        price_df = pd.read_csv(self.DATA_DIR+'/price.csv')
         price_df["Date"] = pd.to_datetime(price_df["Date"])
         price_df["TargetDate"] = pd.to_datetime(price_df["TargetDate"])
         #print("price_df:\n",price_df)
@@ -389,19 +392,22 @@ class FeatureExtractor:
         price_target_df.drop(columns=['Unnamed: 0'],inplace=True)
         print("price_target_df:\n",price_target_df)
 
-        # 5. View the structure of current P/E and other metrics
-        finacials_df = pd.read_csv(FeatureExtractor.DATA_DIR+'/finacials.csv')
-        balancesheet = pd.read_csv(FeatureExtractor.DATA_DIR+'/balancesheet.csv')
-        metrics_df = pd.merge(finacials_df, balancesheet, on=['Ticker','Date'], how='inner')
-        cashflow = pd.read_csv(FeatureExtractor.DATA_DIR+'/cashflow.csv')
+        # 5. current P/E and other metrics
+        """
+        financials_df = pd.read_csv(self.DATA_DIR+'/financials.csv')
+        balancesheet = pd.read_csv(self.DATA_DIR+'/balancesheet.csv')
+        metrics_df = pd.merge(financials_df, balancesheet, on=['Ticker','Date'], how='inner')
+        cashflow = pd.read_csv(self.DATA_DIR+'/cashflow.csv')
         metrics_df = pd.merge(metrics_df, cashflow, on=['Ticker','Date'], how='inner')
+        """
+
+        # 2. Both DataFrames MUST be sorted chronologically by date
+        metrics_df = pd.read_csv(self.DATA_DIR+'/financial_data.csv')
         metrics_df['Date'] = pd.to_datetime(metrics_df['Date'])
         metrics_df = metrics_df.sort_values('Date').reset_index(drop=True)
-
         print("metrics_df:\n", metrics_df)
 
         price_target_df['Date'] = pd.to_datetime(price_target_df['Date'])
-        # 2. Both DataFrames MUST be sorted chronologically by date
         price_target_df = price_target_df.sort_values('Date').reset_index(drop=True)
 
         # 6. Merge historical data and fundamental info together
@@ -410,7 +416,7 @@ class FeatureExtractor:
 
         #merged_df.fillna(0, inplace=True)
         #print(merged_df[merged_df['Ticker'] == 'ICE'][['Ticker', 'Date', 'Close', 'TargetDate', 'Close_Target', 'TaxRateForCalcs']].head(25))
-        merged_df.to_csv(FeatureExtractor.DATA_DIR+'/ainyfina-input.csv')
+        merged_df.to_csv(FeatureExtractor.DATA_DIR+'/ainyfina_data.csv')
 
         self.status = 'Done'
 
