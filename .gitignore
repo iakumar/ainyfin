@@ -1,5 +1,5 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
+# Ignore all __pycache__ folders in any subdirectory
+**/__pycache__/
 *.pyc
 *.pyo
 *.pyd
