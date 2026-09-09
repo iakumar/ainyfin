@@ -29,8 +29,8 @@ class FeatureExtractor:
         #]
         #
 
-        self.funds = ['CCMAZ', 'FBGRX', 'FELV','AMLP', 'IWN' ]
-        self.status = ''
+        self.funds:list[str] = ['CCMAZ', 'FBGRX', 'FELV','AMLP', 'IWN' ]
+        self.status:str = ''
 
 
     def download(self):

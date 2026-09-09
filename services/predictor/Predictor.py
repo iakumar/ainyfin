@@ -28,6 +28,7 @@ class Predictor:
 
     def init_runtime(self):
         local_path = f"/tmp/{XGBMODEL_FILENAME}"
+        print("Loading Model:",  local_path)
         self.xg_model = joblib.load(local_path)
         print("Model running:",  self.xg_model)
 
@@ -39,7 +40,8 @@ class Predictor:
             'Feature': self.xg_model.feature_names_in_,
             'Importance': importances
         }).sort_values(by='Importance', ascending=False)
-        print(feature_imp_df)
+
+        #print(feature_imp_df)
 
 
 
@@ -47,12 +49,12 @@ class Predictor:
         #1 get current price
         price_df = yf.download(tickers, period="1d").stack(level=1).reset_index()
         price_df["Date"] = pd.to_datetime(price_df["Date"]).astype("datetime64[ns]")
-        print(price_df)
+        #print("price_df:\n", price_df)
 
         #need to filter by tickers
         financial_df = pd.read_csv(AinySchema.DATA_DIR+'/financial_data.csv')
         financial_df["Date"] = pd.to_datetime(financial_df["Date"]).astype("datetime64[ns]")
-        print("financial_df:\n", financial_df)
+        #print("financial_df:\n", financial_df)
 
         price_df = price_df.sort_values("Date").reset_index(drop=True)
         financial_df = financial_df.sort_values("Date").reset_index(drop=True)
@@ -98,9 +100,9 @@ class Predictor:
                                   by='Ticker', direction='backward', suffixes=('', '_Trends'))
 
         merged_df.fillna(0, inplace=True)
-        print("create_input final-df:\n",  merged_df)
         input_columns = [col for col in modelBuilder.training_columns if col != "bhsScore"]
         merged_df[input_columns + ['Ticker']].to_csv(AinySchema.DATA_DIR+'/testdata.csv')
+        print("create_input final-df:\n",  input_columns + ['Ticker'])
         return merged_df[input_columns]
 
 
@@ -116,7 +118,7 @@ class Predictor:
         #  print(f"{ticker}: {desc}")
         return ticker_bhs_map
 
-    def predict_with_explanations(self, tickerlist, df: pd.DataFrame, top_k_reasons: int = 4) -> dict:
+    def predict_with_explanations(self, tickerlist:list[str], df: pd.DataFrame, top_k_reasons: int = 4) -> dict:
         """Predicts BHS signals and extracts the top fundamental drivers for each signal.
 
         Parameters:
@@ -199,7 +201,7 @@ def main(args:list):
 
     predictor = Predictor("xg",100)
     predictor.init_runtime()
-    tickerlist = [ticker.strip() for ticker in args[0].split(",")]
+    tickerlist:list[str] = [ticker.strip() for ticker in args[0].split(",")]
     input_df = predictor.create_input(tickerlist)
     #results = predictor.predict(tickerlist, input_df)
     results = predictor.predict_with_explanations(tickerlist, input_df)

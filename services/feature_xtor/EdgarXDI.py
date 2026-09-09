@@ -10,8 +10,8 @@ class EdgarXDI:
     TICKER: str = "Ticker"
 
     def __init__(self, usecase: str):
-        self.usecase = usecase
-        self.status = ''
+        self.usecase:str = usecase
+        self.status:str = ''
 
     def convert_quarter_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """Converts DataFrame columns formatted as 'QX YYYY' to 'MM-DD-YYYY' date strings."""
@@ -41,7 +41,7 @@ class EdgarXDI:
         return df.rename(columns=new_columns)
 
 
-    def cleanup_financial_featureset(self, symbol, df: pd.DataFrame) -> pd.DataFrame:
+    def cleanup_financial_featureset(self, symbol:str, df: pd.DataFrame) -> pd.DataFrame:
         """
         Downloads financial statements for a given ticker and returns a cleaned DataFrame.
 
@@ -73,7 +73,7 @@ class EdgarXDI:
         financial_data_list = []
         for symbol in symbols:
             company = Company(symbol)
-            df1 = company.income_statement(periods=16, period='quarterly', as_dataframe=True).reset_index()
+            df1:pd.DataFrame = company.income_statement(periods=16, period='quarterly', as_dataframe=True).reset_index()
             df1 = self.cleanup_financial_featureset(symbol, df1)
             #print("income_statement df:\n",df1.columns)
             # Concatenate all financial data into a single DataFrame
