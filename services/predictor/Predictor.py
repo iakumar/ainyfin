@@ -1,22 +1,16 @@
 import os
 import sys
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 import joblib
 import numpy as np
 import pandas as pd
-from pandas.tseries.holiday import USFederalHolidayCalendar
-import requests
+import shap
 import yfinance as yf
-from google.cloud import storage
-from sklearn.metrics import accuracy_score, f1_score
-from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 
+from services.consts.AinySchema import AinySchema
 from services.model_builder.ModelBuilder import ModelBuilder
-
 
 BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "anypug.appspot.com")
 DIRECTORY_NAME = "ainyfin/models"
@@ -27,7 +21,6 @@ GBMODEL_FILENAME = "gboost_bhs_model.joblib"
 XGBMODEL_FILENAME = "xgboost_bhs_model.joblib"
 
 class Predictor:
-    DATA_DIR = "/Users/rithuhegde/ainyfin/services/data"
 
     def __init__(self, builder: str, n_estimators: int = 100):
         self.target_column = "bhsScore"
@@ -57,7 +50,7 @@ class Predictor:
         print(price_df)
 
         #need to filter by tickers
-        financial_df = pd.read_csv(self.DATA_DIR+'/financial_data.csv')
+        financial_df = pd.read_csv(AinySchema.DATA_DIR+'/financial_data.csv')
         financial_df["Date"] = pd.to_datetime(financial_df["Date"]).astype("datetime64[ns]")
         print("financial_df:\n", financial_df)
 
@@ -107,7 +100,7 @@ class Predictor:
         merged_df.fillna(0, inplace=True)
         print("create_input final-df:\n",  merged_df)
         input_columns = [col for col in modelBuilder.training_columns if col != "bhsScore"]
-        merged_df[input_columns + ['Ticker']].to_csv(ModelBuilder.DATA_DIR+'/testdata.csv')
+        merged_df[input_columns + ['Ticker']].to_csv(AinySchema.DATA_DIR+'/testdata.csv')
         return merged_df[input_columns]
 
 
@@ -121,6 +114,83 @@ class Predictor:
         # Or print line-by-line
         #for ticker, desc in zip(tickerlist, bhs_desc):
         #  print(f"{ticker}: {desc}")
+        return ticker_bhs_map
+
+    def predict_with_explanations(self, tickerlist, df: pd.DataFrame, top_k_reasons: int = 4) -> dict:
+        """Predicts BHS signals and extracts the top fundamental drivers for each signal.
+
+        Parameters:
+        -----------
+        df : pd.DataFrame
+            DataFrame processed with features matching the trained model.
+        top_k_reasons : int
+            Number of top contributing features to output per ticker.
+
+        Returns:
+        --------
+        dict
+            Dictionary mapping Tickers to their signal and primary driving reasons.
+        """
+        # 1. Prepare features for prediction
+        #
+        modelBuilder = ModelBuilder("xg",100)
+        input_columns = [col for col in modelBuilder.training_columns if col != "bhsScore"]
+        X = df[input_columns].copy()
+        tickers = tickerlist
+
+        # 2. Get class probabilities and predicted indices
+        preds_proba = self.xg_model.predict_proba(X)
+        preds = self.xg_model.predict(X)
+
+        # Map target encoding back to string labels (e.g., {0: 'Buy', 1: 'Hold', 2: 'Sell'})
+        label_map = {0: "Buy", 1: "Hold", 2: "Sell"}
+        signals = [label_map[p] for p in preds]
+
+        # 3. Compute SHAP values for feature attribution
+        explainer = shap.TreeExplainer(self.xg_model)
+        shap_values = explainer.shap_values(X)
+
+        results = {}
+        for i, ticker in enumerate(tickers):
+            pred_class_idx = preds[i]
+            signal = signals[i]
+
+            # Extract exact probability for the predicted class
+            confidence = preds_proba[i][pred_class_idx]
+
+            # Extract full class probabilities dictionary
+            prob_distribution = {
+                label_map[j]: round(float(preds_proba[i][j]), 4)
+                for j in range(len(label_map))
+            }
+
+            # Handle SHAP multi-class output (list of arrays or 3D array)
+            if isinstance(shap_values, list):
+                sample_shap = shap_values[pred_class_idx][i]
+            else:  # shape: (n_samples, n_features, n_classes)
+                sample_shap = shap_values[i, :, pred_class_idx]
+
+            # Rank features by absolute SHAP impact for this prediction
+            top_indices = np.argsort(np.abs(sample_shap))[::-1][:top_k_reasons]
+
+            reasons = []
+            for idx in top_indices:
+                feat_name = input_columns[idx]
+                feat_val = X.iloc[i, idx]
+                shap_impact = sample_shap[idx]
+
+                direction = "supported" if shap_impact > 0 else "weakened"
+                reasons.append(f"{feat_name} ({feat_val:.4f}) {direction} signal")
+
+            #results[ticker] = {"Signal": signal, "Primary_Reasons": reasons}
+            results[ticker] = {"Signal": signal,
+                               "Confidence": f"{confidence:.1%}",
+                               "Probabilities": prob_distribution,
+                               "Primary_Reasons":reasons
+                               }
+
+        return results
+
 
 def main(args:list):
     if len(args) < 1:
@@ -131,8 +201,11 @@ def main(args:list):
     predictor.init_runtime()
     tickerlist = [ticker.strip() for ticker in args[0].split(",")]
     input_df = predictor.create_input(tickerlist)
-    predictor.predict(tickerlist, input_df)
-
+    #results = predictor.predict(tickerlist, input_df)
+    results = predictor.predict_with_explanations(tickerlist, input_df)
+    for ticker, info in results.items():
+        reasons_str = ", ".join(info["Primary_Reasons"])
+        print(f"{ticker}: {info['Signal']} | {info['Confidence']} | {info['Probabilities']} | Reasons: {reasons_str}")
 
 if __name__ == "__main__":
     main(sys.argv[1:])

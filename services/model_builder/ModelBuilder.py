@@ -6,14 +6,15 @@ from zoneinfo import ZoneInfo
 import joblib
 import numpy as np
 import pandas as pd
-from pandas.tseries.holiday import USFederalHolidayCalendar
 import requests
 import yfinance as yf
-from google.cloud import storage
+from pandas.tseries.holiday import USFederalHolidayCalendar
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
+
+from services.consts.AinySchema import AinySchema
 
 BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "anypug.appspot.com")
 DIRECTORY_NAME = "ainyfin/models"
@@ -24,8 +25,6 @@ GBMODEL_FILENAME = "gboost_bhs_model.joblib"
 XGBMODEL_FILENAME = "xgboost_bhs_model.joblib"
 
 class ModelBuilder:
-    DATA_DIR = "/Users/rithuhegde/ainyfin/services/data"
-
     def __init__(self, builder: str, n_estimators: int = 100):
         self.target_column = "bhsScore"
         self.bhs_descs = ["Sell", "Hold", "Buy"]
@@ -133,20 +132,21 @@ class ModelBuilder:
         """
         Fetch your historical training feature dataset...
         """
-        print("Fetching historical training feature dataset...")
-        raw_df = pd.read_csv(ModelBuilder.DATA_DIR+'/ainyfina_data.csv')
+        print("Loading ainyfin_data training feature dataset...")
+        raw_df = pd.read_csv(AinySchema.DATA_DIR+'/ainyfin_data.csv')
         raw_df = raw_df.sort_values(['Ticker','Date'])
         snapshot_df = self.compute_financial_snapshot(raw_df)
-        snapshot_df.to_csv(ModelBuilder.DATA_DIR+'/snapshot.csv')
+        snapshot_df.to_csv(AinySchema.DATA_DIR+'/snapshot.csv')
         snapshot_df[['Ticker', "bhsScore"]] = raw_df[['Ticker', "bhsScore"]].replace([np.inf, -np.inf], np.nan)
         snapshot_df['Date'] = pd.to_datetime(snapshot_df['Date'])
         snapshot_df = snapshot_df.sort_values(['Date']).reset_index(drop=True)
 
-        financial_df = pd.read_csv(ModelBuilder.DATA_DIR+'/financial_data.csv')
+        financial_df = pd.read_csv(AinySchema.DATA_DIR+'/financial_data.csv')
         financial_df['Date'] = pd.to_datetime(financial_df['Date'])
         financial_df = financial_df.sort_values(['Ticker','Date']).reset_index(drop=True)
         financial_trends_df = self.compute_financial_trends(financial_df)
         financial_trends_df = financial_trends_df.sort_values(['Date']).reset_index(drop=True)
+        financial_trends_df.to_csv(AinySchema.DATA_DIR+'/trends.csv')
 
         merged_df = pd.merge_asof(snapshot_df, financial_trends_df, left_on='Date', right_on='Date',
                                   by='Ticker', direction='backward', suffixes=('', '_Trends'))
@@ -811,10 +811,6 @@ class ModelBuilder:
 
 
 def main(args:list):
-    if len(args) < 1:
-        print("Ticker list needed")
-        return
-
     print(f"=== Starting Weekly Training Job Execution: {datetime.now(ZoneInfo('America/New_York')).date()} ===")
     modelBuilder = ModelBuilder("xg",100)
     feature_df = modelBuilder.load_train_data()

@@ -1,10 +1,11 @@
-from edgar import Company, set_identity
 import pandas as pd
-from consts.AinySchema import AinySchema
+from edgar import Company, set_identity
+
+from services.consts.AinySchema import AinySchema
+
 
 class EdgarXDI:
 
-    DATA_DIR: str ="/Users/rithuhegde/ainyfin/services/data"
     DATE: str = "Date"
     TICKER: str = "Ticker"
 
@@ -66,7 +67,7 @@ class EdgarXDI:
         return df_clean
 
 
-    def downloadFinancialData(self, symbols):
+    def downloadFinancialData(self, symbols:list[str]):
         set_identity("info@iakumar.com")
 
         financial_data_list = []
@@ -74,15 +75,13 @@ class EdgarXDI:
             company = Company(symbol)
             df1 = company.income_statement(periods=16, period='quarterly', as_dataframe=True).reset_index()
             df1 = self.cleanup_financial_featureset(symbol, df1)
-            print("income_statement df:\n",df1.columns)
+            #print("income_statement df:\n",df1.columns)
             # Concatenate all financial data into a single DataFrame
 
             df2 = company.balance_sheet(periods=16, period='quarterly', as_dataframe=True).reset_index()
             df2 = self.cleanup_financial_featureset(symbol, df2)
-            print("balance_sheet df:\n",df2.columns)
-            bs_dups = [
-                "AdditionalItems"
-            ]
+            #print("balance_sheet df:\n",df2.columns)
+            bs_dups = ["AdditionalItems"]
             df2 = df2.drop(columns=[c for c in bs_dups if c in df2.columns])
 
             df3 = company.cash_flow_statement(periods=16, period='quarterly', as_dataframe=True).reset_index()
@@ -142,7 +141,7 @@ class EdgarXDI:
             ]
             df3 = df3.drop(columns=[c for c in cf_dups if c in df3.columns])
 
-            print("cash_flow_statement df:\n",df3.columns)
+            #print("cash_flow_statement df:\n",df3.columns)
             for df in [df1, df2, df3]:
                 df["Date"] = pd.to_datetime(df["Date"])
 
@@ -158,5 +157,5 @@ class EdgarXDI:
         final_df['WorkingCapital'] = final_df['AssetsCurrent'] - final_df['LiabilitiesCurrent']
         final_df['FreeCashFlow'] = final_df['NetCashProvidedByUsedInOperatingActivities'] - final_df['PaymentsToAcquirePropertyPlantAndEquipment']
 
-        final_df.to_csv(self.DATA_DIR+"/financial_data.csv", index=False)
+        final_df.to_csv(AinySchema.DATA_DIR+"/financial_data.csv", index=False)
         print("Final merged financial data saved to 'financial_data.csv'.")

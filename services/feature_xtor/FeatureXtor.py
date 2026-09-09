@@ -1,19 +1,20 @@
 from datetime import datetime, timedelta, timezone
-from typing import final
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from services.consts.AinySchema import AinySchema
+
 from .EdgarXDI import EdgarXDI
+
 
 class FeatureExtractor:
 
-    DATA_DIR="/Users/rithuhegde/ainyfin/services/data"
     def __init__(self, usecase: str):
         self.usecase = usecase
-        self.symbols = ['ICE','MANH','AMD','GOOG','MSFT','HOOD','TT','NET','ETN','PSX','AAPL','NVDA',
+        self.symbols:list[str] = ['ICE','MANH','AMD','GOOG','MSFT','HOOD','TT','NET','ETN','PSX','AAPL','NVDA',
                         'EOG','GRMN','PANW','XOM','SNOW','TSLA','MRK','IQV','WFC','CBRE',
                         'TMO','NFLX','INTU','MDLZ','Z','XYZ','AMZN','LRCX','GE','GS','PLTR']
         #self.symbols = [
@@ -46,7 +47,7 @@ class FeatureExtractor:
         price_df = price_df.stack(level=1).reset_index()
         price_df = price_df.sort_values('Date').reset_index(drop=True)
         price_df["TargetDate"] = price_df["Date"] + pd.to_timedelta(look_ahead+1, unit='D')
-        price_df.to_csv(self.DATA_DIR+'/price.csv')
+        price_df.to_csv(AinySchema.DATA_DIR+'/price.csv')
 
         """
         #2 Financials
@@ -163,7 +164,7 @@ class FeatureExtractor:
             c for c in core_features if c in unified_df.columns
         ]
         normalized_df = unified_df[final_cols]
-        normalized_df.to_csv(self.DATA_DIR+'/financials.csv', index=False, header=True)
+        normalized_df.to_csv(AinySchema.DATA_DIR+'/financials.csv', index=False, header=True)
 
 
     def downloadBalancesheet(self, start_date, end_date):
@@ -251,7 +252,7 @@ class FeatureExtractor:
             c for c in core_features if c in unified_df.columns
         ]
         normalized_df = unified_df[final_cols].copy()
-        normalized_df.to_csv(self.DATA_DIR+'/balancesheet.csv', index=False, header=True)
+        normalized_df.to_csv(AinySchema.DATA_DIR+'/balancesheet.csv', index=False, header=True)
 
 
     def downloadCashflow(self, start_date, end_date):
@@ -327,7 +328,7 @@ class FeatureExtractor:
             c for c in core_features if c in unified_df.columns
         ]
         normalized_df = unified_df[final_cols].copy()
-        normalized_df.to_csv(self.DATA_DIR+'/cashflow.csv', index=False, header=True)
+        normalized_df.to_csv(AinySchema.DATA_DIR+'/cashflow.csv', index=False, header=True)
 
 
     def downloadMisc(self, start_date, end_date):
@@ -344,12 +345,12 @@ class FeatureExtractor:
             actions = actions[
                 (actions["Date"] >= start_date) & (actions["Date"] <= end_date)
             ]
-            actions.to_csv(self.DATA_DIR+'/actions.csv', mode=mode, index=False, header=write_header)
+            actions.to_csv(AinySchema.DATA_DIR+'/actions.csv', mode=mode, index=False, header=write_header)
 
             price_targets = pd.DataFrame([ticker_obj.get_analyst_price_targets()])
             price_targets['Ticker'] = symbol
             price_targets['Date'] = datetime.now(timezone.utc).date()
-            price_targets.to_csv(self.DATA_DIR+'/price_targets.csv',mode=mode, index=False, header=write_header)
+            price_targets.to_csv(AinySchema.DATA_DIR+'/price_targets.csv',mode=mode, index=False, header=write_header)
 
             write_header = False
             mode = "a"
@@ -366,12 +367,13 @@ class FeatureExtractor:
 
 
     def load(self):
-        price_df = pd.read_csv(self.DATA_DIR+'/price.csv')
+        # 1. Load the price data
+        price_df = pd.read_csv(AinySchema.DATA_DIR+'/price.csv')
         price_df["Date"] = pd.to_datetime(price_df["Date"])
         price_df["TargetDate"] = pd.to_datetime(price_df["TargetDate"])
         #print("price_df:\n",price_df)
 
-        # Self-merge example
+        #2 Self-merge to find the nearest price on the target date for each stock
         price_target_df = pd.merge_asof(
             price_df.sort_values('TargetDate'),
             price_df[['Ticker', 'Date', 'Close']].sort_values('Date'),
@@ -381,28 +383,26 @@ class FeatureExtractor:
             direction='nearest',
             suffixes=('', '_Target'))
 
-        #print("price_target_df:\n",price_target_df.head(100))
-
         price_target_df['Pct_Diff'] = ((price_target_df['Close_Target'] - price_target_df['Close']) / price_target_df['Close']) * 100
         #print("price_target_df:",price_target_df['Pct_Diff'])
         price_target_df.dropna(subset=['Pct_Diff'],inplace=True)
         price_target_df['bhsScore'] = pd.qcut(price_target_df['Pct_Diff'].round(0).astype(int), q=3, labels=[1, 2, 3]).astype(int)
 
-        # 4. Clean up the temporary column if needed
+        # 3. Clean up the temporary column if needed
         price_target_df.drop(columns=['Unnamed: 0'],inplace=True)
         print("price_target_df:\n",price_target_df)
 
-        # 5. current P/E and other metrics
+        # 4. current P/E and other metrics
         """
-        financials_df = pd.read_csv(self.DATA_DIR+'/financials.csv')
-        balancesheet = pd.read_csv(self.DATA_DIR+'/balancesheet.csv')
+        financials_df = pd.read_csv(AinySchema.DATA_DIR+'/financials.csv')
+        balancesheet = pd.read_csv(AinySchema.DATA_DIR+'/balancesheet.csv')
         metrics_df = pd.merge(financials_df, balancesheet, on=['Ticker','Date'], how='inner')
-        cashflow = pd.read_csv(self.DATA_DIR+'/cashflow.csv')
+        cashflow = pd.read_csv(AinySchema.DATA_DIR+'/cashflow.csv')
         metrics_df = pd.merge(metrics_df, cashflow, on=['Ticker','Date'], how='inner')
         """
 
-        # 2. Both DataFrames MUST be sorted chronologically by date
-        metrics_df = pd.read_csv(self.DATA_DIR+'/financial_data.csv')
+        # 5. Both DataFrames MUST be sorted chronologically by date
+        metrics_df = pd.read_csv(AinySchema.DATA_DIR+'/financial_data.csv')
         metrics_df['Date'] = pd.to_datetime(metrics_df['Date'])
         metrics_df = metrics_df.sort_values('Date').reset_index(drop=True)
         print("metrics_df:\n", metrics_df)
@@ -416,7 +416,7 @@ class FeatureExtractor:
 
         #merged_df.fillna(0, inplace=True)
         #print(merged_df[merged_df['Ticker'] == 'ICE'][['Ticker', 'Date', 'Close', 'TargetDate', 'Close_Target', 'TaxRateForCalcs']].head(25))
-        merged_df.to_csv(FeatureExtractor.DATA_DIR+'/ainyfina_data.csv')
+        merged_df.to_csv(AinySchema.DATA_DIR+'/ainyfin_data.csv')
 
         self.status = 'Done'
 
@@ -425,9 +425,11 @@ def main():
     print(f"=== Starting Feature Extraction : {datetime.now(ZoneInfo('America/New_York')).date()} ===")
     featureExtractor = FeatureExtractor("BHS")
     featureExtractor.download();
-    featureExtractor.load();
     if featureExtractor.status == 'Done':
-        print("=== Feature Extraction Completed Successfully ===")
+        print("=== Feature Download Completed Successfully ===")
+        featureExtractor.load();
+        if featureExtractor.status == 'Done':
+            print("=== Feature Load Completed Successfully ===")
     else:
         print("Warning: Feature DataFrame was empty. Aborting Extraction.")
 
