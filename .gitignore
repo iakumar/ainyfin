@@ -1,5 +1,9 @@
-services/__pycache__
-services/data
-services/fin
-consts/__pycache__
-feature_xtor/__pycache__
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Application data & virtual environments
+services/data/
+services/fin/

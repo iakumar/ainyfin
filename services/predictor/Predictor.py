@@ -15,7 +15,7 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 
-from ..model_builder.ModelBuilder import ModelBuilder
+from services.model_builder.ModelBuilder import ModelBuilder
 
 
 BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "anypug.appspot.com")
@@ -51,20 +51,21 @@ class Predictor:
 
 
     def create_input(self, tickers):
+        #1 get current price
         price_df = yf.download(tickers, period="1d").stack(level=1).reset_index()
         price_df["Date"] = pd.to_datetime(price_df["Date"]).astype("datetime64[ns]")
         print(price_df)
 
-        #need to folter by tickers
-        metrics_df = pd.read_csv(self.DATA_DIR+'/financial_data.csv')
-        metrics_df["Date"] = pd.to_datetime(metrics_df["Date"]).astype("datetime64[ns]")
-        print("metrics_df:\n", metrics_df)
+        #need to filter by tickers
+        financial_df = pd.read_csv(self.DATA_DIR+'/financial_data.csv')
+        financial_df["Date"] = pd.to_datetime(financial_df["Date"]).astype("datetime64[ns]")
+        print("financial_df:\n", financial_df)
 
         price_df = price_df.sort_values("Date").reset_index(drop=True)
-        metrics_df = metrics_df.sort_values("Date").reset_index(drop=True)
+        financial_df = financial_df.sort_values("Date").reset_index(drop=True)
 
-        # 6. Merge historical data and fundamental info together
-        merged_df = pd.merge_asof(price_df, metrics_df, left_on='Date',  right_on='Date',
+        # 2. Merge historical data and fundamental info together
+        merged_df = pd.merge_asof(price_df, financial_df, left_on='Date',  right_on='Date',
                                   by='Ticker',    direction='backward')
 
         #print("metrics_df after price:\n",  merged_df)
@@ -82,19 +83,30 @@ class Predictor:
             "CommonStockDividendPaid",
             "RepurchaseOfCapitalStock",
         ]
-        for col in zero_fill_cols:
-            if col in merged_df.columns:
-                merged_df[col] = merged_df[col].fillna(0)
-            else:
-                merged_df[col] = 0
+
+        existing_cols = [c for c in zero_fill_cols if c in merged_df.columns]
+        if existing_cols:
+            merged_df[existing_cols] = merged_df[existing_cols].fillna(0)
+
+        missing_cols = [c for c in zero_fill_cols if c not in merged_df.columns]
+        if missing_cols:
+            missing_df = pd.DataFrame(0, index=merged_df.index, columns=missing_cols, dtype=float)
+            merged_df = pd.concat([merged_df, missing_df], axis=1)
 
         modelBuilder = ModelBuilder("xg",100)
-        merged_df = modelBuilder.compute_financial_snapshot(merged_df)
-        #print("metrics_df after compute_financial_snapshot:\n",  merged_df)
+        snapshot_df = modelBuilder.compute_financial_snapshot(merged_df)
+        snapshot_df = snapshot_df.sort_values(['Date']).reset_index(drop=True)
+        #print("metrics_df after compute_financial_snapshot:\n",  snapshot_df)
+
+        financial_trends_df = modelBuilder.compute_financial_trends(financial_df)
+        financial_trends_df = financial_trends_df.sort_values(['Date']).reset_index(drop=True)
+
+        merged_df = pd.merge_asof(snapshot_df, financial_trends_df, left_on='Date', right_on='Date',
+                                  by='Ticker', direction='backward', suffixes=('', '_Trends'))
 
         merged_df.fillna(0, inplace=True)
         print("create_input final-df:\n",  merged_df)
-        input_columns = [col for col in self.training_columns if col != "bhsScore"]
+        input_columns = [col for col in modelBuilder.training_columns if col != "bhsScore"]
         merged_df[input_columns + ['Ticker']].to_csv(ModelBuilder.DATA_DIR+'/testdata.csv')
         return merged_df[input_columns]
 

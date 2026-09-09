@@ -142,13 +142,13 @@ class ModelBuilder:
         snapshot_df['Date'] = pd.to_datetime(snapshot_df['Date'])
         snapshot_df = snapshot_df.sort_values(['Date']).reset_index(drop=True)
 
-        quarterly_df = pd.read_csv(ModelBuilder.DATA_DIR+'/financial_data.csv')
-        quarterly_df['Date'] = pd.to_datetime(quarterly_df['Date'])
-        quarterly_df = quarterly_df.sort_values(['Ticker','Date']).reset_index(drop=True)
-        quarterly_df = self.compute_financial_trends(quarterly_df)
-        quarterly_df = quarterly_df.sort_values(['Date']).reset_index(drop=True)
+        financial_df = pd.read_csv(ModelBuilder.DATA_DIR+'/financial_data.csv')
+        financial_df['Date'] = pd.to_datetime(financial_df['Date'])
+        financial_df = financial_df.sort_values(['Ticker','Date']).reset_index(drop=True)
+        financial_trends_df = self.compute_financial_trends(financial_df)
+        financial_trends_df = financial_trends_df.sort_values(['Date']).reset_index(drop=True)
 
-        merged_df = pd.merge_asof(snapshot_df, quarterly_df, left_on='Date', right_on='Date',
+        merged_df = pd.merge_asof(snapshot_df, financial_trends_df, left_on='Date', right_on='Date',
                                   by='Ticker', direction='backward', suffixes=('', '_Trends'))
         return merged_df
 
@@ -817,8 +817,8 @@ def main(args:list):
 
     print(f"=== Starting Weekly Training Job Execution: {datetime.now(ZoneInfo('America/New_York')).date()} ===")
     modelBuilder = ModelBuilder("xg",100)
-    #feature_df = modelBuilder.load_train_data()
-    #success = modelBuilder.train(feature_df)
+    feature_df = modelBuilder.load_train_data()
+    success = modelBuilder.train(feature_df)
     success = True
     if success == True:
         print("=== Training Job Completed Successfully ===")
