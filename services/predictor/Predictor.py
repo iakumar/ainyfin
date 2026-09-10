@@ -24,7 +24,6 @@ class Predictor:
 
     def __init__(self, builder: str, n_estimators: int = 100):
         self.target_column = "bhsScore"
-        self.bhs_descs = ["Sell", "Hold", "Buy"]
 
     def init_runtime(self):
         local_path = f"/tmp/{XGBMODEL_FILENAME}"
@@ -47,7 +46,17 @@ class Predictor:
 
     def create_input(self, tickers):
         #1 get current price
-        price_df = yf.download(tickers, period="1d").stack(level=1).reset_index()
+        price_df = yf.download(tickers, period="1d", progress=False)
+        if not price_df.empty:
+            # Drop columns where all values are NaN (failed tickers)
+            price_df = price_df.dropna(how="all", axis=1)
+            price_df = price_df.stack(level=1, future_stack=True).reset_index()
+        else:
+            print("No price data found for tickers:", tickers)
+            return pd.DataFrame()  # Return an empty DataFrame if no data is found
+
+        print("price_df tickers:", price_df['Ticker'].unique())
+
         price_df["Date"] = pd.to_datetime(price_df["Date"]).astype("datetime64[ns]")
         #print("price_df:\n", price_df)
 
@@ -104,14 +113,14 @@ class Predictor:
         merged_df[input_columns + ['Ticker']].to_csv(AinySchema.DATA_DIR+'/testdata.csv')
         print("create_input final-df:\n",  input_columns + ['Ticker'])
         print("create_input final-df:\n",  merged_df[input_columns + ['Ticker']])
-        return merged_df[input_columns]
+        return merged_df[input_columns + ['Ticker']]
 
 
     def predict(self, tickerlist, input_df):
         out_pred = self.xg_model.predict(input_df)
-        bhs_desc = [self.bhs_descs[value] for value in out_pred]
+        out_pred_desc = [AinySchema.BHS_DESCS[value] for value in out_pred]
         # Map ticker to description into a dict
-        ticker_bhs_map = dict(zip(tickerlist, bhs_desc))
+        ticker_bhs_map = dict(zip(tickerlist, out_pred_desc))
         print(f"BHS Predictions: {ticker_bhs_map}")
 
         # Or print line-by-line
@@ -176,20 +185,24 @@ class Predictor:
             # Rank features by absolute SHAP impact for this prediction
             top_indices = np.argsort(np.abs(sample_shap))[::-1][:top_k_reasons]
 
-            reasons = []
+            p_reasons = []
+            n_reasons = []
             for idx in top_indices:
                 feat_name = input_columns[idx]
                 feat_val = X.iloc[i, idx]
                 shap_impact = sample_shap[idx]
 
-                direction = "supported" if shap_impact > 0 else "weakened"
-                reasons.append(f"{feat_name} ({feat_val:.4f}) {direction} signal")
+                if shap_impact > 0:
+                    p_reasons.append(f"{feat_name} ({feat_val:.4f})")
+                else:
+                    n_reasons.append(f"{feat_name} ({feat_val:.4f})")
 
             #results[ticker] = {"Signal": signal, "Primary_Reasons": reasons}
             results[ticker] = {"Signal": signal,
                                "Confidence": f"{confidence:.1%}",
                                "Probabilities": prob_distribution,
-                               "Primary_Reasons":reasons
+                               "P_Reasons": p_reasons,
+                               "N_Reasons": n_reasons
                                }
 
         return results
@@ -201,14 +214,19 @@ def main(args:list):
         return
 
     predictor = Predictor("xg",100)
-    predictor.init_runtime()
     tickerlist:list[str] = [ticker.strip() for ticker in args[0].split(",")]
     input_df = predictor.create_input(tickerlist)
-    #results = predictor.predict(tickerlist, input_df)
-    results = predictor.predict_with_explanations(tickerlist, input_df)
-    for ticker, info in results.items():
-        reasons_str = ", ".join(info["Primary_Reasons"])
-        print(f"{ticker}: {info['Signal']} | {info['Confidence']} | {info['Probabilities']} | Reasons: {reasons_str}")
+    if input_df.empty == False:
+        predictor.init_runtime()
+        valid_tickers = input_df['Ticker'].tolist()
+        #results = predictor.predict(valid_tickers, input_df)
+        results = predictor.predict_with_explanations(valid_tickers, input_df)
+        for ticker, info in results.items():
+            p_reasons_str = ", ".join(info["P_Reasons"])
+            n_reasons_str = ", ".join(info["N_Reasons"])
+            print(f"{ticker}: {info['Signal']} | {info['Confidence']} | {info['Probabilities']} | Supported by: {p_reasons_str} | Weakened by: {n_reasons_str}")
+    else:
+        print("No input data available for tickers.")
 
 if __name__ == "__main__":
     main(sys.argv[1:])

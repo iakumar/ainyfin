@@ -12,7 +12,7 @@ from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
-
+from sklearn.metrics import classification_report, confusion_matrix
 from services.consts.AinySchema import AinySchema
 
 BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "anypug.appspot.com")
@@ -26,7 +26,7 @@ XGBMODEL_FILENAME = "xgboost_bhs_model.joblib"
 class ModelBuilder:
     def __init__(self, builder: str, n_estimators: int = 100):
         self.target_column:str = "bhsScore"
-        self.bhs_descs:list[str] = ["Sell", "Hold", "Buy"]
+        self.symbols:list[str] = []
         # Explicit list of generated ratio columns
         self.ratio_columns:list[str] = [
             "Price_To_Earnings",
@@ -59,7 +59,6 @@ class ModelBuilder:
             "Payout_To_FCF",
             "NonOperating_Income_Reliance",
             "Goodwill_To_Assets",
-            "Had_Goodwill_Impairment",
             "Effective_Tax_Rate"
         ]
 
@@ -157,58 +156,46 @@ class ModelBuilder:
 
         merged_df = pd.merge_asof(snapshot_df, financial_trends_df, left_on='Date', right_on='Date',
                                   by='Ticker', direction='backward', suffixes=('', '_Trends'))
+        self.symbols = merged_df['Ticker'].unique().tolist()
         return merged_df
+
 
 
     def compute_financial_snapshot(self, df: pd.DataFrame) -> pd.DataFrame:
         """Computes standardized valuation, leverage, profitability, and quality ratios
-
         from raw SEC fundamental and market price data.
-
-        Parameters:
-        -----------
-        df : pd.DataFrame
-            Must contain raw fundamental columns and market price.
-
-        Returns:
-        --------
-        pd.DataFrame
-            DataFrame augmented with engineered ratio features.
         """
 
         def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
-            """
-                Performs element-wise division, returning np.nan for invalid or zero denominator
-                rather than coercing to 0.0 or inf.
-            """
-            # Replace zeros in denominator with NaN before division to propagate NaN correctly
+            """Performs element-wise division, returning np.nan for invalid or zero denominator."""
             denom_clean = denominator.replace(0, np.nan)
             result = numerator / denom_clean
+            return result.replace([np.inf, -np.inf], np.nan)
 
-            # Replace inf / -inf results (e.g., non-zero numerator divided by ~0) with NaN
-            result = result.replace([np.inf, -np.inf], np.nan)
-            return result
+        def get_col(col_name: str, fallback_val=np.nan) -> pd.Series:
+            """Safely fetch a column or return a default series if missing."""
+            if col_name in data.columns:
+                # Coerce non-numeric or missing entries cleanly to float
+                return pd.to_numeric(data[col_name], errors="coerce")
+            return pd.Series(fallback_val, index=data.index)
 
-        def get_col(col_name: str) -> pd.Series:
-                if col_name in data.columns:
-                    return data[col_name].astype(float)
-                return pd.Series(np.nan, index=data.index)
-
-        # Create a copy to prevent mutating the input DataFrame
+        # Prevent mutating input
         data = df.copy()
 
         # =========================================================================
         # PRE-COMPUTATION & TAG MAPPINGS
         # =========================================================================
 
-        # 1. Total Revenue / Operating Revenue
-        revenue = get_col("RevenueFromContractWithCustomerExcludingAssessedTax").where(
-            lambda x: x != 0, get_col("Revenues")
+        # 1. Total Revenue (Chained SEC XBRL Tags)
+        revenue = (
+            get_col("RevenueFromContractWithCustomerExcludingAssessedTax")
+            .where(lambda x: x.notna() & (x != 0), get_col("Revenues"))
+            .where(lambda x: x.notna() & (x != 0), get_col("SalesRevenueNet"))
         )
 
         # 2. Net Income
         net_income = get_col("NetIncomeLoss").where(
-            lambda x: x != 0, get_col("ProfitLoss")
+            lambda x: x.notna() & (x != 0), get_col("ProfitLoss")
         )
 
         # 3. Balance Sheet Aggregates
@@ -218,104 +205,119 @@ class ModelBuilder:
         stockholders_equity = get_col("StockholdersEquity")
 
         # 4. Total Debt & Liquidity
-        # Use TotalDebt column if present, otherwise compute sum of current + non-current debt
         total_debt = get_col("TotalDebt").where(
-            lambda x: x != 0,
-            get_col("LongTermDebtCurrent") + get_col("LongTermDebtNoncurrent"),
+            lambda x: x.notna() & (x != 0),
+            get_col("LongTermDebtCurrent").fillna(0) + get_col("LongTermDebtNoncurrent").fillna(0),
         )
 
         cash_and_equivalents = get_col(
             "CashCashEquivalentsAndShortTermInvestments"
         ).where(
-            lambda x: x != 0,
-            get_col("CashCashEquivalentsAtCarryingValue")
-            + get_col("ShortTermInvestments"),
+            lambda x: x.notna() & (x != 0),
+            get_col("CashCashEquivalentsAtCarryingValue").fillna(0)
+            + get_col("ShortTermInvestments").fillna(0),
         )
 
         accounts_receivable = get_col("AccountsReceivableNetCurrent").where(
-            lambda x: x != 0, get_col("AccountsReceivableNet")
+            lambda x: x.notna() & (x != 0), get_col("AccountsReceivableNet")
         )
 
         # 5. Earnings Metrics (EBIT & Normalized EBITDA)
-        operating_income = get_col("OperatingIncomeLoss")
+        operating_income = get_col("OperatingIncomeLoss").where(
+            lambda x: x.notna() & (x != 0),
+            get_col("OperatingIncome").where(
+                lambda x: x.notna() & (x != 0),
+                revenue - get_col("OperatingExpenses")
+            )
+        )
+
+        # Fixed syntax chaining for interest expense
         interest_expense = get_col("InterestExpense").where(
-            lambda x: x != 0,
-            get_col(
-                "InterestExpenseNonoperating", get_col("InterestExpenseOperating")
-            ),
+            lambda x: x.notna() & (x != 0),
+            get_col("InterestExpenseNonoperating").where(
+                lambda x: x.notna() & (x != 0),
+                get_col("InterestExpenseOperating")
+            )
         )
 
-        # EBIT (Operating Income + Non-operating items if required, defaulting to Operating Income)
-        ebit = operating_income.where(lambda x: x != 0, net_income + interest_expense)
+        ebit = operating_income.where(
+            lambda x: x.notna() & (x != 0),
+            net_income.fillna(0) + interest_expense.fillna(0)
+        )
 
-        # Depreciation & Amortization
+        # Expanded D&A tag resolution
         dna = get_col("DepreciationDepletionAndAmortization").where(
-            lambda x: x != 0,
+            lambda x: x.notna() & (x != 0),
             get_col("DepreciationAndAmortization").where(
-                lambda x: x != 0,
-                get_col("Depreciation")
-                + get_col("AmortizationOfIntangibleAssets"),
-            ),
+                lambda x: x.notna() & (x != 0),
+                get_col("DepreciationAmortizationAndAccretion").where(
+                    lambda x: x.notna() & (x != 0),
+                    get_col("Depreciation").fillna(0) + get_col("AmortizationOfIntangibleAssets").fillna(0)
+                )
+            )
         )
 
-        # Adjustments for Normalized EBITDA
+        # Fixed syntax chaining for Share-Based Compensation
         sbc = get_col("ShareBasedCompensation").where(
-            lambda x: x != 0,
-            get_col(
-                "SharebasedCompensationArrangementBySharebasedPaymentAwardCompensationCost1",
-                get_col("AllocatedShareBasedCompensationExpense"),
-            ),
+            lambda x: x.notna() & (x != 0),
+            get_col("SharebasedCompensationArrangementBySharebasedPaymentAwardCompensationCost1").where(
+                lambda x: x.notna() & (x != 0),
+                get_col("AllocatedShareBasedCompensationExpense")
+            )
         )
 
         restructuring = get_col("RestructuringCosts").where(
-            lambda x: x != 0,
+            lambda x: x.notna() & (x != 0),
             get_col("RestructuringAndRelatedCostIncurredCost"),
         )
 
         impairments = (
-            get_col("GoodwillImpairmentLoss")
-            + get_col("ImpairmentOfIntangibleAssetsExcludingGoodwill")
-            + get_col("InventoryWriteDown")
+            get_col("GoodwillImpairmentLoss").fillna(0)
+            + get_col("ImpairmentOfIntangibleAssetsExcludingGoodwill").fillna(0)
+            + get_col("InventoryWriteDown").fillna(0)
         )
 
         gains_losses = (
-            get_col("GainLossOnSaleOfPropertyPlantEquipment")
-            + get_col("GainLossOnSaleOfBusiness")
-            + get_col("EquitySecuritiesFvNiGainLoss")
+            get_col("GainLossOnSaleOfPropertyPlantEquipment").fillna(0)
+            + get_col("GainLossOnSaleOfBusiness").fillna(0)
+            + get_col("EquitySecuritiesFvNiGainLoss").fillna(0)
         )
 
+        ebitda_base = operating_income.fillna(0) + dna.fillna(0)
         normalized_ebitda = (
-            operating_income + dna + sbc + restructuring + impairments
-        ) - gains_losses
+            ebitda_base
+            + sbc.fillna(0)
+            + restructuring.fillna(0)
+            + impairments
+            - gains_losses
+        ).where(lambda x: x != 0, ebitda_base)
 
         # 6. Expenses & Cash Flows
         gross_profit = get_col("GrossProfit").where(
-            lambda x: x != 0, get_col("GrossProfit_Calculated")
+            lambda x: x.notna() & (x != 0), get_col("GrossProfit_Calculated")
         )
 
         cfo = get_col("NetCashProvidedByUsedInOperatingActivities")
         capex = get_col("PaymentsToAcquirePropertyPlantAndEquipment").abs()
-        fcf = get_col("FreeCashFlow").where(lambda x: x != 0, cfo - capex)
+        fcf = get_col("FreeCashFlow").where(lambda x: x.notna() & (x != 0), cfo - capex)
         rd_expense = get_col("ResearchAndDevelopmentExpense")
 
         # Share Count and Market Cap
         shares_diluted = get_col(
             "WeightedAverageNumberOfDilutedSharesOutstanding"
         ).where(
-            lambda x: x != 0,
+            lambda x: x.notna() & (x != 0),
             get_col("WeightedAverageNumberOfSharesOutstandingBasic"),
         )
         market_cap = get_col("Close") * shares_diluted
-        enterprise_value = market_cap + total_debt - cash_and_equivalents
+        enterprise_value = market_cap + total_debt.fillna(0) - cash_and_equivalents.fillna(0)
 
         # =========================================================================
         # COMPUTED FINANCIAL RATIOS
         # =========================================================================
 
         # 1. Valuation Ratios
-        data["Price_To_Earnings"] = safe_divide(
-            data["Close"], get_col("EarningsPerShareDiluted")
-        )
+        data["Price_To_Earnings"] = safe_divide(data["Close"], get_col("EarningsPerShareDiluted"))
         data["Price_To_FreeCashFlow"] = safe_divide(market_cap, fcf)
         data["Price_To_Book"] = safe_divide(market_cap, stockholders_equity)
         data["Price_To_Sales"] = safe_divide(market_cap, revenue)
@@ -343,9 +345,7 @@ class ModelBuilder:
 
         # 4. Operational Efficiency
         data["Asset_Turnover"] = safe_divide(revenue, total_assets)
-        data["Working_Capital_Turnover"] = safe_divide(
-            revenue, get_col("WorkingCapital")
-        )
+        data["Working_Capital_Turnover"] = safe_divide(revenue, get_col("WorkingCapital"))
 
         # 5. Earnings Quality & Capital Allocation
         data["CFO_To_NetIncome"] = safe_divide(cfo, net_income)
@@ -354,11 +354,11 @@ class ModelBuilder:
         data["CapEx_To_Revenue"] = safe_divide(capex, revenue)
         data["R_And_D_To_Revenue"] = safe_divide(rd_expense, revenue)
 
-        #Literature-Validated Earnings Quality Signals
+        # Earnings Quality Signals
         data["Accrual_Ratio"] = safe_divide(net_income - cfo, total_assets)
         data["Payout_To_FCF"] = safe_divide(
-            get_col("PaymentsOfDividendsCommonStock").abs()
-            + get_col("PaymentsForRepurchaseOfCommonStock").abs(),
+            get_col("PaymentsOfDividendsCommonStock").abs().fillna(0)
+            + get_col("PaymentsForRepurchaseOfCommonStock").abs().fillna(0),
             fcf,
         ).clip(-5.0, 5.0)
 
@@ -368,58 +368,16 @@ class ModelBuilder:
 
         data["Goodwill_To_Assets"] = safe_divide(get_col("Goodwill"), total_assets)
 
-        data["Had_Goodwill_Impairment"] = (get_col("GoodwillImpairmentLoss") > 0).astype(int)
+        impairment_col = "GoodwillImpairmentLoss"
+        if impairment_col in data.columns:
+            data["Had_Goodwill_Impairment"] = (data[impairment_col].fillna(0) > 0).astype(int)
+        else:
+            data["Had_Goodwill_Impairment"] = np.nan
 
         tax_base = get_col(
             "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"
         )
-        data["Effective_Tax_Rate"] = safe_divide(get_col("IncomeTaxExpenseBenefit"), tax_base).clip(0.0,0.50)
-
-        # Clean extreme inf / -inf values on calculated ratio columns only
-        if hasattr(self, "ratio_columns") and self.ratio_columns:
-            data[self.ratio_columns] = data[self.ratio_columns].replace(
-                [np.inf, -np.inf], np.nan
-            )
-        else:
-            # Fallback if ratio_columns attribute is not defined on class instance
-            ratio_cols = [
-                "Price_To_Earnings",
-                "Price_To_FreeCashFlow",
-                "Price_To_Book",
-                "Price_To_Sales",
-                "EV_To_EBITDA",
-                "EV_To_EBIT",
-                "Gross_Margin",
-                "Operating_Margin",
-                "EBITDA_Margin",
-                "Net_Margin",
-                "FCF_Margin",
-                "Return_On_Equity",
-                "Return_On_Assets",
-                "Debt_To_Equity",
-                "Debt_To_Assets",
-                "Current_Ratio",
-                "Quick_Ratio",
-                "Interest_Coverage",
-                "Cash_To_Debt",
-                "Asset_Turnover",
-                "Working_Capital_Turnover",
-                "CFO_To_NetIncome",
-                "SBC_To_Revenue",
-                "CapEx_To_CFO",
-                "CapEx_To_Revenue",
-                "R_And_D_To_Revenue",
-                "Accrual_Ratio",
-                "Payout_To_FCF",
-                "NonOperating_Income_Reliance",
-                "Goodwill_To_Assets",
-                "Had_Goodwill_Impairment",
-                "Effective_Tax_Rate"
-            ]
-
-            for col in ratio_cols:
-               if col in data.columns:
-                  data[col] = data[col].replace([np.inf, -np.inf], np.nan)
+        data["Effective_Tax_Rate"] = safe_divide(get_col("IncomeTaxExpenseBenefit"), tax_base).clip(0.0, 0.50)
 
         return data
 
@@ -428,250 +386,184 @@ class ModelBuilder:
         """Computes quarterly YoY momentum, acceleration, and margin delta signals
 
         from raw fundamental line items and calculated ratios.
-
-        Parameters:
-        -----------
-        df : pd.DataFrame
-            Must contain 'Ticker', 'Date', and normalized fundamental features/ratios
-            sorted chronologically by Ticker and Date.
-
-        Returns:
-        --------
-        pd.DataFrame
-            DataFrame augmented with fundamental trend features.
         """
-
         data = df.copy()
-        # Ensure dataset is sorted strictly by Ticker and Date
         data = data.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
-        # -------------------------------------------------------------
-        # HELPER FUNCTIONS
-        # -------------------------------------------------------------
-        def get_col(col_name: str, fallback_val=0) -> pd.Series:
-            """Safely fetch a column or return a default series if missing."""
-            if col_name in data.columns:
-                return data[col_name].fillna(fallback_val)
-            return pd.Series(fallback_val, index=data.index)
+        def _get_col(name: str, fallback=0.0) -> pd.Series:
+            if name in data.columns:
+                return data[name].fillna(fallback)
+            return pd.Series(fallback, index=data.index)
 
-        def safe_pct_change(series: pd.Series, periods: int) -> pd.Series:
-            """Vectorized safe percentage change helper supporting sign-flips & zero division."""
-            prev = series.groupby(data["Ticker"]).shift(periods)
+        def _safe_divide(num: pd.Series, den: pd.Series) -> pd.Series:
+            res = np.where((den == 0) | den.isna(), np.nan, num / den)
+            return pd.Series(res, index=data.index)
+
+        grouped = data.groupby("Ticker")
+
+        def _pct_change(series: pd.Series, periods: int) -> pd.Series:
+            if series.name and series.name in data.columns:
+                prev = grouped[series.name].shift(periods)
+            else:
+                prev = series.groupby(data["Ticker"]).shift(periods)
             denom = prev.abs()
-            return (series - prev).divide(denom).where(
-                (denom != 0) & denom.notna(), np.nan
-            )
+            res = (series - prev).divide(denom).where((denom != 0) & denom.notna(), np.nan)
+            return pd.Series(res, index=data.index)
 
-        def safe_delta(series: pd.Series, periods: int) -> pd.Series:
-            """Vectorized safe difference (delta) helper for margins/ratios."""
-            prev = series.groupby(data["Ticker"]).shift(periods)
-            return series - prev
-
-        def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
-            """Helper to prevent Division-by-Zero and np.inf errors."""
-            return np.where(
-                (denominator == 0) | (denominator.isna()),
-                np.nan,
-                numerator / denominator,
-            )
+        def _delta(series: pd.Series, periods: int) -> pd.Series:
+            if series.name and series.name in data.columns:
+                prev = grouped[series.name].shift(periods)
+            else:
+                prev = series.groupby(data["Ticker"]).shift(periods)
+            return pd.Series(series - prev, index=data.index)
 
         # -------------------------------------------------------------
         # BASE VARIABLE MAPPINGS & FALLBACK DERIVATIONS
         # -------------------------------------------------------------
-        # Revenue (Primary SEC tag with fallback to Revenues)
-        revenue = get_col("RevenueFromContractWithCustomerExcludingAssessedTax").where(
-            lambda x: x != 0, get_col("Revenues")
-        )
+        rev_contract = _get_col("RevenueFromContractWithCustomerExcludingAssessedTax")
+        rev_gen = _get_col("Revenues")
+        revenue = pd.Series(np.where(rev_contract != 0, rev_contract, rev_gen), index=data.index, name="Revenue")
 
-        # Net Income
-        net_income = get_col("NetIncomeLoss").where(
-            lambda x: x != 0, get_col("ProfitLoss")
-        )
+        net_inc_raw = _get_col("NetIncomeLoss")
+        profit_loss = _get_col("ProfitLoss")
+        net_income = pd.Series(np.where(net_inc_raw != 0, net_inc_raw, profit_loss), index=data.index, name="NetIncome")
 
-        # Depreciation & Amortization
-        dna = get_col("DepreciationDepletionAndAmortization").where(
-            lambda x: x != 0,
-            get_col("DepreciationAndAmortization").where(
-                lambda x: x != 0,
-                get_col("Depreciation")
-                + get_col("AmortizationOfIntangibleAssets"),
-            ),
-        )
+        dna = _get_col("DepreciationDepletionAndAmortization")
+        dna_alt = _get_col("DepreciationAndAmortization")
+        dna_sum = _get_col("Depreciation") + _get_col("AmortizationOfIntangibleAssets")
+        dna_final = pd.Series(np.where(dna != 0, dna, np.where(dna_alt != 0, dna_alt, dna_sum)), index=data.index, name="DNA")
 
-        # Operating Cash Flow & CapEx
-        cfo = get_col("NetCashProvidedByUsedInOperatingActivities")
-        capex = get_col("PaymentsToAcquirePropertyPlantAndEquipment").abs()
+        cfo = _get_col("NetCashProvidedByUsedInOperatingActivities").rename("CFO")
+        capex = _get_col("PaymentsToAcquirePropertyPlantAndEquipment").abs().rename("CapEx")
+        fcf_tag = _get_col("FreeCashFlow")
+        fcf = pd.Series(np.where(fcf_tag != 0, fcf_tag, cfo - capex), index=data.index, name="FCF")
 
-        # Derived Free Cash Flow (use EDGAR tag if present, fallback to CFO - CapEx)
-        fcf = get_col("FreeCashFlow").where(lambda x: x != 0, cfo - capex)
+        op_inc = _get_col("OperatingIncomeLoss").rename("OperatingIncome")
+        sbc_arr = _get_col("SharebasedCompensationArrangementBySharebasedPaymentAwardCompensationCost1")
+        sbc_alloc = _get_col("AllocatedShareBasedCompensationExpense")
+        sbc_alt = np.where(sbc_arr != 0, sbc_arr, sbc_alloc)
+        sbc = _get_col("ShareBasedCompensation").where(lambda x: x != 0, sbc_alt)
 
-        # Operating Income & Derived EBITDA
-        operating_income = get_col("OperatingIncomeLoss")
-        sbc = get_col("ShareBasedCompensation").where(
-            lambda x: x != 0,
-            get_col(
-                "SharebasedCompensationArrangementBySharebasedPaymentAwardCompensationCost1",
-                get_col("AllocatedShareBasedCompensationExpense"),
-            ),
-        )
-
-        restructuring = get_col("RestructuringCosts").where(
-            lambda x: x != 0,
-            get_col("RestructuringAndRelatedCostIncurredCost"),
+        restruct = _get_col("RestructuringCosts").where(
+            lambda x: x != 0, _get_col("RestructuringAndRelatedCostIncurredCost")
         )
 
         impairments = (
-            get_col("GoodwillImpairmentLoss")
-            + get_col("ImpairmentOfIntangibleAssetsExcludingGoodwill")
-            + get_col("InventoryWriteDown")
+            _get_col("GoodwillImpairmentLoss")
+            + _get_col("ImpairmentOfIntangibleAssetsExcludingGoodwill")
+            + _get_col("InventoryWriteDown")
         )
 
         gains_losses = (
-            get_col("GainLossOnSaleOfPropertyPlantEquipment")
-            + get_col("GainLossOnSaleOfBusiness")
-            + get_col("EquitySecuritiesFvNiGainLoss")
+            _get_col("GainLossOnSaleOfPropertyPlantEquipment")
+            + _get_col("GainLossOnSaleOfBusiness")
+            + _get_col("EquitySecuritiesFvNiGainLoss")
         )
 
-        # EBITDA / Normalized EBITDA
-        normalized_ebitda = get_col("NormalizedEBITDA").where(
-            lambda x: x != 0,
-            (operating_income + dna + sbc + restructuring + impairments)
-            - gains_losses,
+        norm_ebitda = pd.Series(
+            (op_inc + dna_final + sbc + restruct + impairments) - gains_losses,
+            index=data.index,
+            name="NormEBITDA"
         )
+        ebitda = pd.Series(op_inc + dna_final, index=data.index, name="EBITDA")
 
-        ebitda = operating_income + dna
-
-        # Gross Profit & Cost of Goods Sold
-        cogs = get_col("CostOfGoodsAndServicesSold").where(
-            lambda x: x != 0, get_col("CostOfRevenue")
+        cogs = _get_col("CostOfGoodsAndServicesSold").where(
+            lambda x: x != 0, _get_col("CostOfRevenue")
         )
-        gross_profit = get_col("GrossProfit").where(
-            lambda x: x != 0,
-            get_col("GrossProfit_Calculated").where(
-                lambda x: x != 0, revenue - cogs
+        gp_calc = _get_col("GrossProfit_Calculated").where(lambda x: x != 0, revenue - cogs)
+        gross_profit = pd.Series(_get_col("GrossProfit").where(lambda x: x != 0, gp_calc), index=data.index, name="GrossProfit")
+
+        shares_diluted = pd.Series(
+            _get_col("WeightedAverageNumberOfDilutedSharesOutstanding").where(
+                lambda x: x != 0,
+                _get_col("WeightedAverageNumberOfSharesOutstandingBasic")
             ),
+            index=data.index,
+            name="SharesDiluted"
         )
 
-        # Diluted Shares
-        shares_diluted = get_col(
-            "WeightedAverageNumberOfDilutedSharesOutstanding"
-        ).where(
-            lambda x: x != 0,
-            get_col("WeightedAverageNumberOfSharesOutstandingBasic"),
+        total_debt = pd.Series(
+            _get_col("TotalDebt").where(
+                lambda x: x != 0,
+                _get_col("LongTermDebtCurrent") + _get_col("LongTermDebtNoncurrent")
+            ),
+            index=data.index,
+            name="TotalDebt"
         )
 
-        # Total Debt & Working Capital
-        total_debt = get_col("TotalDebt").where(
-            lambda x: x != 0,
-            get_col("LongTermDebtCurrent") + get_col("LongTermDebtNoncurrent"),
+        working_cap = pd.Series(
+            _get_col("WorkingCapital").where(
+                lambda x: x != 0,
+                _get_col("AssetsCurrent") - _get_col("LiabilitiesCurrent")
+            ),
+            index=data.index,
+            name="WorkingCapital"
         )
 
-        working_capital = get_col("WorkingCapital").where(
-            lambda x: x != 0,
-            get_col("AssetsCurrent") - get_col("LiabilitiesCurrent"),
-        )
-
-        stockholders_equity = get_col("StockholdersEquity")
+        equity = _get_col("StockholdersEquity").rename("Equity")
+        eps_diluted = pd.Series(_get_col("EarningsPerShareDiluted"), index=data.index, name="EPS")
 
         # -------------------------------------------------------------
-        # 1. Growth Velocity (YoY: 4 Quarters, QoQ: 1 Quarter)
+        # FEATURE COMPUTATION
         # -------------------------------------------------------------
-        data["Revenue_QoQ_Growth"] = safe_pct_change(revenue, 1)
-        data["EBITDA_YoY_Growth"] = safe_pct_change(normalized_ebitda, 4)
-        data["EPS_YoY_Growth"] = safe_pct_change(
-            get_col("EarningsPerShareDiluted"), 4
-        )
-        data["FCF_YoY_Growth"] = safe_pct_change(fcf, 4)
-        data["Operating_CashFlow_YoY_Growth"] = safe_pct_change(cfo, 4)
+        # 1. Growth Velocity
+        data["Revenue_QoQ_Growth"] = _pct_change(revenue, 1)
+        data["Revenue_YoY_Growth"] = _pct_change(revenue, 4)
+        data["EBITDA_YoY_Growth"] = _pct_change(norm_ebitda, 4)
+        data["EPS_YoY_Growth"] = _pct_change(eps_diluted, 4)
+        data["FCF_YoY_Growth"] = _pct_change(fcf, 4)
+        data["Operating_CashFlow_YoY_Growth"] = _pct_change(cfo, 4)
 
-        # -------------------------------------------------------------
-        # 2. Fundamental Acceleration / Deceleration
-        # -------------------------------------------------------------
-        data["Revenue_YoY_Growth"] = safe_pct_change(revenue, 4)
+        # 2. Fundamental Acceleration
         data["Revenue_Acceleration"] = (
-            data.groupby("Ticker")["Revenue_YoY_Growth"]
-            .diff(1)
-            .clip(-1.0,1.0)
+            data.groupby("Ticker")["Revenue_YoY_Growth"].diff(1).clip(-1.0, 1.0)
         )
 
-        # -------------------------------------------------------------
-        # 3. Margin Expansion / Contraction (Basis Point Deltas)
-        # -------------------------------------------------------------
-        data["Gross_Margin"] = safe_divide(gross_profit, revenue)
-        data["Gross_Margin_YoY_Delta"] = safe_delta(data["Gross_Margin"], 4)
+        # 3. Margins & Deltas
+        data["Gross_Margin"] = _safe_divide(gross_profit, revenue)
+        data["Gross_Margin_YoY_Delta"] = _delta(data["Gross_Margin"].rename("Gross_Margin"), 4)
 
-        data["EBITDA_Margin"] = safe_divide(ebitda, revenue)
-        data["EBITDA_Margin_YoY_Delta"] = safe_delta(data["EBITDA_Margin"], 4)
+        data["EBITDA_Margin"] = _safe_divide(ebitda, revenue)
+        data["EBITDA_Margin_YoY_Delta"] = _delta(data["EBITDA_Margin"].rename("EBITDA_Margin"), 4)
 
-        data["FCF_Margin"] = safe_divide(fcf, revenue)
-        data["FCF_Margin_YoY_Delta"] = safe_delta(data["FCF_Margin"], 4)
+        data["FCF_Margin"] = _safe_divide(fcf, revenue)
+        data["FCF_Margin_YoY_Delta"] = _delta(data["FCF_Margin"].rename("FCF_Margin"), 4)
 
-        data["Operating_Margin"] = safe_divide(operating_income, revenue)
-        data["Operating_Margin_QoQ_Delta"] = safe_delta(
-            data["Operating_Margin"], 1
-        )
+        data["Operating_Margin"] = _safe_divide(op_inc, revenue)
+        data["Operating_Margin_QoQ_Delta"] = _delta(data["Operating_Margin"].rename("Operating_Margin"), 1)
 
-        # -------------------------------------------------------------
-        # 4. Capital Structure & Reinvestment Velocity
-        # -------------------------------------------------------------
-        data["Debt_YoY_Growth"] = safe_pct_change(total_debt, 4)
-        data["Shares_Outstanding_YoY_Change"] = safe_pct_change(shares_diluted, 4)
-        data["CapEx_YoY_Growth"] = safe_pct_change(capex, 4)
+        # 4. Capital Structure & Reinvestment
+        data["Debt_YoY_Growth"] = _pct_change(total_debt, 4)
+        data["Shares_Outstanding_YoY_Change"] = _pct_change(shares_diluted, 4)
+        data["CapEx_YoY_Growth"] = _pct_change(capex, 4)
 
-        # -------------------------------------------------------------
         # 5. Financial Health Trajectory Signals
-        # -------------------------------------------------------------
-        data["Return_On_Equity"] = safe_divide(net_income, stockholders_equity)
-        data["ROIC_YoY_Delta"] = safe_delta(data["Return_On_Equity"], 4)
-        data["Working_Capital_YoY_Change"] = safe_pct_change(working_capital, 4)
+        data["Return_On_Equity"] = _safe_divide(net_income, equity)
+        data["ROIC_YoY_Delta"] = _delta(data["Return_On_Equity"].rename("Return_On_Equity"), 4)
+        data["Working_Capital_YoY_Change"] = _pct_change(working_cap, 4)
 
-        # -------------------------------------------------------------
-        # 6. Fundamental Stability & Volatility (8-Quarter Rolling Window)
-        # -------------------------------------------------------------
-        # Pre-compute base metrics if not already present in the incoming DataFrame
-        if "Return_On_Equity" not in data.columns:
-            data["Return_On_Equity"] = safe_divide(net_income, stockholders_equity)
-        if "Net_Margin" not in data.columns:
-            data["Net_Margin"] = safe_divide(net_income, revenue)
+        # 6. Fundamental Volatility
+        data["Net_Margin"] = _safe_divide(net_income, revenue)
 
-        data["ROE_Volatility_8Q"] = (
-            data.groupby("Ticker")["Return_On_Equity"]
-            .transform(lambda s: s.rolling(8, min_periods=4).std())
+        data["ROE_Volatility_8Q"] = data.groupby("Ticker")["Return_On_Equity"].transform(
+            lambda s: s.rolling(8, min_periods=4).std()
+        )
+        data["Margin_Volatility_8Q"] = data.groupby("Ticker")["Net_Margin"].transform(
+            lambda s: s.rolling(8, min_periods=4).std()
         )
 
-        data["Margin_Volatility_8Q"] = (
-            data.groupby("Ticker")["Net_Margin"]
-            .transform(lambda s: s.rolling(8, min_periods=4).std())
-        )
+        # Clean Extreme Infinite Values across all newly added numerical columns
+        new_cols = [
+            "Revenue_QoQ_Growth", "Revenue_YoY_Growth", "EBITDA_YoY_Growth", "EPS_YoY_Growth",
+            "FCF_YoY_Growth", "Operating_CashFlow_YoY_Growth", "Revenue_Acceleration",
+            "Gross_Margin", "Gross_Margin_YoY_Delta", "EBITDA_Margin", "EBITDA_Margin_YoY_Delta",
+            "FCF_Margin", "FCF_Margin_YoY_Delta", "Operating_Margin", "Operating_Margin_QoQ_Delta",
+            "Debt_YoY_Growth", "Shares_Outstanding_YoY_Change", "CapEx_YoY_Growth",
+            "Return_On_Equity", "ROIC_YoY_Delta", "Working_Capital_YoY_Change",
+            "Net_Margin", "ROE_Volatility_8Q", "Margin_Volatility_8Q"
+        ]
 
-        # Clean extreme inf / -inf values generated by zero division
-        if hasattr(self, "trend_columns") and self.trend_columns:
-            data[self.trend_columns] = data[self.trend_columns].replace(
-                [np.inf, -np.inf], np.nan
-            )
-        else:
-            # Fallback if self.trend_columns is not explicitly assigned
-            trend_cols = [
-                "Revenue_QoQ_Growth",
-                "EBITDA_YoY_Growth",
-                "EPS_YoY_Growth",
-                "FCF_YoY_Growth",
-                "Operating_CashFlow_YoY_Growth",
-                "Revenue_YoY_Growth",
-                "Revenue_Acceleration",
-                "Gross_Margin_YoY_Delta",
-                "EBITDA_Margin_YoY_Delta",
-                "FCF_Margin_YoY_Delta",
-                "Operating_Margin_QoQ_Delta",
-                "Debt_YoY_Growth",
-                "Shares_Outstanding_YoY_Change",
-                "CapEx_YoY_Growth",
-                "ROIC_YoY_Delta",
-                "Working_Capital_YoY_Change",
-                "ROE_Volatility_8Q",
-                "Margin_Volatility_8Q"
-            ]
-            data[trend_cols] = data[trend_cols].replace([np.inf, -np.inf], np.nan)
+        data[new_cols] = data[new_cols].replace([np.inf, -np.inf], np.nan)
 
         return data
 
@@ -850,23 +742,28 @@ class ModelBuilder:
         # 3. Make Test predictions
         y_pred = self.xg_model.predict(X_test)
         predictions = [round(value) for value in y_pred]
-        print(f"Test Predictions: {predictions}\n")
+        #print(f"Test Predictions: {predictions}\n")
+        out_pred_desc = [AinySchema.BHS_DESCS[value] for value in y_pred]
+        for ticker, desc in zip(self.symbols, out_pred_desc):
+          print(f"{ticker}: {desc}")
 
         le = LabelEncoder()
         y_test_encoded = le.fit_transform(y_test)
         accuracy = accuracy_score(y_test_encoded, predictions)
         print("xg_model Accuracy: %.2f%%\n" % (accuracy * 100.0))
+        print(classification_report(y_test, y_pred))
+        print(confusion_matrix(y_test, y_pred))
 
 
     def predict(self, tickerlist, input_df):
         out_pred = self.xg_model.predict(input_df)
-        bhs_desc = [self.bhs_descs[value] for value in out_pred]
+        out_pred_desc = [AinySchema.BHS_DESCS[value] for value in out_pred]
         # Map ticker to description into a dict
-        ticker_bhs_map = dict(zip(tickerlist, bhs_desc))
+        ticker_bhs_map = dict(zip(tickerlist, out_pred_desc))
         #print(f"BHS Predictions: {ticker_bhs_map}")
 
         # Or print line-by-line
-        for ticker, desc in zip(tickerlist, bhs_desc):
+        for ticker, desc in zip(tickerlist, out_pred_desc):
           print(f"{ticker}: {desc}")
 
 

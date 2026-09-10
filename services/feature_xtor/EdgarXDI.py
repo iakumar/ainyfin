@@ -62,7 +62,7 @@ class EdgarXDI:
         df_clean = self.convert_quarter_columns(df_clean).set_index('Date').T.reset_index()
         df_clean.rename(columns={'index': 'Date'}, inplace=True)
         df_clean['Ticker'] = symbol
-        print("df_clean:\n",df_clean)
+        #print("df_clean:\n",df_clean)
 
         return df_clean
 

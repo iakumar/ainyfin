@@ -36,7 +36,7 @@ class FeatureExtractor:
     def download(self):
         # 1. setup params for start and end
         training_window = 4 * 365
-        look_ahead = 30
+        look_ahead = 90
         today = datetime.now(timezone.utc).date()
         start_date = today - timedelta(days=(training_window+look_ahead))
         end_date = today - timedelta(days= look_ahead)
@@ -44,7 +44,14 @@ class FeatureExtractor:
 
         #2 Price
         price_df = yf.download(self.symbols, start=start_date, end=end_date, auto_adjust=True)
-        price_df = price_df.stack(level=1).reset_index()
+        if not price_df.empty:
+            # Drop columns where all values are NaN (failed tickers)
+            price_df = price_df.dropna(how="all", axis=1)
+            price_df = price_df.stack(level=1, future_stack=True).reset_index()
+        else:
+            print("No price data found for tickers:", self.symbols)
+            return pd.DataFrame()
+
         price_df = price_df.sort_values('Date').reset_index(drop=True)
         price_df["TargetDate"] = price_df["Date"] + pd.to_timedelta(look_ahead+1, unit='D')
         price_df.to_csv(AinySchema.DATA_DIR+'/price.csv')
@@ -386,7 +393,12 @@ class FeatureExtractor:
         price_target_df['Pct_Diff'] = ((price_target_df['Close_Target'] - price_target_df['Close']) / price_target_df['Close']) * 100
         #print("price_target_df:",price_target_df['Pct_Diff'])
         price_target_df.dropna(subset=['Pct_Diff'],inplace=True)
-        price_target_df['bhsScore'] = pd.qcut(price_target_df['Pct_Diff'].round(0).astype(int), q=3, labels=[1, 2, 3]).astype(int)
+
+        hold_threshold = 10.0  # Adjust this percentage based on your desired 'small' range
+        bins = [-np.inf, 0, hold_threshold, np.inf]
+        # 1:Sell, 2: Hold, 3: Buy
+        labels = [1, 2, 3]
+        price_target_df['bhsScore'] = pd.cut(price_target_df['Pct_Diff'], bins=bins, labels=labels, include_lowest=True).astype(int)
 
         # 3. Clean up the temporary column if needed
         price_target_df.drop(columns=['Unnamed: 0'],inplace=True)
