@@ -72,9 +72,15 @@ class EdgarXDI:
 
         financial_data_list = []
         for symbol in symbols:
+            print(f"downloadFinancialData: {symbol}\n")
             company = Company(symbol)
-            df1:pd.DataFrame = company.income_statement(periods=16, period='quarterly', as_dataframe=True).reset_index()
-            df1 = self.cleanup_financial_featureset(symbol, df1)
+            try:
+                df1:pd.DataFrame = company.income_statement(periods=16, period='quarterly', as_dataframe=True).reset_index()
+                df1 = self.cleanup_financial_featureset(symbol, df1)
+            except Exception as e:
+                print(f"Error downloading income statement for {symbol}: {e}")
+                continue
+
             #print("income_statement df:\n",df1.columns)
             # Concatenate all financial data into a single DataFrame
 

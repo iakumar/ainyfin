@@ -55,13 +55,18 @@ class Predictor:
             print("No price data found for tickers:", tickers)
             return pd.DataFrame()  # Return an empty DataFrame if no data is found
 
-        print("price_df tickers:", price_df['Ticker'].unique())
+        print("price_df tickers:", price_df['Ticker'].unique().tolist())
 
         price_df["Date"] = pd.to_datetime(price_df["Date"]).astype("datetime64[ns]")
         #print("price_df:\n", price_df)
 
         #need to filter by tickers
         financial_df = pd.read_csv(AinySchema.DATA_DIR+'/financial_data.csv')
+        financial_df = financial_df[financial_df['Ticker'].isin(price_df['Ticker'])]
+        if financial_df.empty:
+            print("No financial data found for tickers:", price_df['Ticker'].unique().tolist())
+            return pd.DataFrame()  # Return an empty DataFrame if no data is found
+
         financial_df["Date"] = pd.to_datetime(financial_df["Date"]).astype("datetime64[ns]")
         #print("financial_df:\n", financial_df)
 

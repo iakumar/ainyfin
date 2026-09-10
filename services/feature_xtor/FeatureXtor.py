@@ -14,22 +14,16 @@ class FeatureExtractor:
 
     def __init__(self, usecase: str):
         self.usecase = usecase
-        self.symbols:list[str] = ['ICE','MANH','AMD','GOOG','MSFT','HOOD','TT','NET','ETN','PSX','AAPL','NVDA',
-                        'EOG','GRMN','PANW','XOM','SNOW','TSLA','MRK','IQV','WFC','CBRE',
-                        'TMO','NFLX','INTU','MDLZ','Z','XYZ','AMZN','LRCX','GE','GS','PLTR']
-        #self.symbols = [
-        #    "ICE", "MANH", 'AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL', 'GOOG', 'META', 'LLY', 'AVGO',
-        #    'JPM', 'TSLA', 'WMT', 'XOM', 'UNH', 'MA', 'PG', 'JNJ', 'COST', 'MRK',
-        #    'HD', 'ABBV', 'CVX', 'NFLX', 'CRM', 'BAC', 'PEP', 'AMD', 'LIN', 'ACN',
-        #    'ORCL', 'TMO', 'IBM', 'CSCO', 'DIS', 'QCOM', 'CAT', 'TMUS', 'DHR', 'INTU',
-        #    'VZ', 'UBER', 'WFC', 'GE', 'AMGN', 'PM', 'COP', 'UNP', 'LOW', 'ISRG', "MU"
-        #
-        # HOOD, TT, NET, ETN, PSX, EOG, GRMN, PANW, AMLP, IWN, XOM, SNOW, TSLA, MRK, IQV,
-        # WFC, CBRE, TMO, NFLX, INTU, MDLZ, Z, XYZ, GE, GS, AMZN, LRCX, GE, GS, PLTR,
-        #]
-        #
+        self.symbols:list[str] = [
+            'AAPL', 'AMD', 'AMZN', 'ABNB', 'CBRE', 'CMCSA', 'CRWD', 'DAL', 'DUK', 'EOG', 'ETN', 'GE', 'GEV', 'GOOG', 'GOOGL', 'GRMN', 'GS',
+            'HOOD', 'ICE', 'INTU', 'IQV', 'IR', 'JNJ', 'JPM', 'KO', 'LRCX', 'LRCX', 'LYB', 'MANH', 'MDLZ', 'META', 'MRK', 'MSFT', 'NET', 'NFLX',
+            'NVDA', 'PANW', 'PG', 'PLTR', 'PSX', 'RH', 'SNOW', 'SO', 'T', 'TMO', 'TSLA', 'TT', 'TROW', 'V', 'WFC', 'WMT', 'XOM', 'XYZ', 'Z'
+        ]
 
-        self.funds:list[str] = ['CCMAZ', 'FBGRX', 'FELV','AMLP', 'IWN' ]
+        self.funds:list[str] = [
+            '857480610', '857480628', 'AMLP', 'IWN', 'CCMAZ', 'FBCGX', 'FGKFX', 'FBGRX', 'FFSFX', 'FLKSX', 'FXAIX', 'FELV', 'GLD',
+            'WFPRX'
+        ]
         self.status:str = ''
 
 
