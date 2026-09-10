@@ -103,6 +103,7 @@ class Predictor:
         input_columns = [col for col in modelBuilder.training_columns if col != "bhsScore"]
         merged_df[input_columns + ['Ticker']].to_csv(AinySchema.DATA_DIR+'/testdata.csv')
         print("create_input final-df:\n",  input_columns + ['Ticker'])
+        print("create_input final-df:\n",  merged_df[input_columns + ['Ticker']])
         return merged_df[input_columns]
 
 

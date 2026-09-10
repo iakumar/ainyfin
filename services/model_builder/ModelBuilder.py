@@ -7,7 +7,6 @@ import joblib
 import numpy as np
 import pandas as pd
 import requests
-import yfinance as yf
 from pandas.tseries.holiday import USFederalHolidayCalendar
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
@@ -26,10 +25,10 @@ XGBMODEL_FILENAME = "xgboost_bhs_model.joblib"
 
 class ModelBuilder:
     def __init__(self, builder: str, n_estimators: int = 100):
-        self.target_column = "bhsScore"
-        self.bhs_descs = ["Sell", "Hold", "Buy"]
+        self.target_column:str = "bhsScore"
+        self.bhs_descs:list[str] = ["Sell", "Hold", "Buy"]
         # Explicit list of generated ratio columns
-        self.ratio_columns = [
+        self.ratio_columns:list[str] = [
             "Price_To_Earnings",
             "Price_To_FreeCashFlow",
             "Price_To_Book",
@@ -56,10 +55,16 @@ class ModelBuilder:
             "CapEx_To_CFO",
             "CapEx_To_Revenue",
             "R_And_D_To_Revenue",
+            "Accrual_Ratio",
+            "Payout_To_FCF",
+            "NonOperating_Income_Reliance",
+            "Goodwill_To_Assets",
+            "Had_Goodwill_Impairment",
+            "Effective_Tax_Rate"
         ]
 
         # Collect trend feature columns for inf handling
-        self.trend_columns = [
+        self.trend_columns:list[str] = [
             "Revenue_YoY_Growth",
             "Revenue_QoQ_Growth",
             "EBITDA_YoY_Growth",
@@ -76,13 +81,15 @@ class ModelBuilder:
             "CapEx_YoY_Growth",
             "ROIC_YoY_Delta",
             "Working_Capital_YoY_Change",
+            "ROE_Volatility_8Q",
+            "Margin_Volatility_8Q"
         ]
 
-        self.training_columns = self.ratio_columns + self.trend_columns + ["bhsScore"]
+        self.training_columns:list[str] = self.ratio_columns + self.trend_columns + ["bhsScore"]
         #print("training_columns:", self.training_columns)
-        self.builder = builder
-        self.n_estimators = n_estimators
-        self.xg_model = None
+        self.builder:str = builder
+        self.n_estimators:int = n_estimators
+        self.xg_model:any = None
 
 
     def getMostRecentMarketDate(self):
@@ -169,21 +176,23 @@ class ModelBuilder:
             DataFrame augmented with engineered ratio features.
         """
 
-        def safe_divide(
-            numerator: pd.Series, denominator: pd.Series
-        ) -> pd.Series:
-            """Helper to prevent Division-by-Zero and np.inf errors."""
-            return np.where(
-                (denominator == 0) | (denominator.isna()),
-                np.nan,
-                numerator / denominator,
-            )
+        def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+            """
+                Performs element-wise division, returning np.nan for invalid or zero denominator
+                rather than coercing to 0.0 or inf.
+            """
+            # Replace zeros in denominator with NaN before division to propagate NaN correctly
+            denom_clean = denominator.replace(0, np.nan)
+            result = numerator / denom_clean
 
-        def get_col(col_name: str, fallback_val=0) -> pd.Series:
-            """Safely fetch a column or return a default series if missing."""
-            if col_name in df.columns:
-                return df[col_name].fillna(fallback_val)
-            return pd.Series(fallback_val, index=df.index)
+            # Replace inf / -inf results (e.g., non-zero numerator divided by ~0) with NaN
+            result = result.replace([np.inf, -np.inf], np.nan)
+            return result
+
+        def get_col(col_name: str) -> pd.Series:
+                if col_name in data.columns:
+                    return data[col_name].astype(float)
+                return pd.Series(np.nan, index=data.index)
 
         # Create a copy to prevent mutating the input DataFrame
         data = df.copy()
@@ -345,6 +354,27 @@ class ModelBuilder:
         data["CapEx_To_Revenue"] = safe_divide(capex, revenue)
         data["R_And_D_To_Revenue"] = safe_divide(rd_expense, revenue)
 
+        #Literature-Validated Earnings Quality Signals
+        data["Accrual_Ratio"] = safe_divide(net_income - cfo, total_assets)
+        data["Payout_To_FCF"] = safe_divide(
+            get_col("PaymentsOfDividendsCommonStock").abs()
+            + get_col("PaymentsForRepurchaseOfCommonStock").abs(),
+            fcf,
+        ).clip(-5.0, 5.0)
+
+        data["NonOperating_Income_Reliance"] = safe_divide(
+            get_col("OtherNonoperatingIncomeExpense").abs(), net_income.abs()
+        )
+
+        data["Goodwill_To_Assets"] = safe_divide(get_col("Goodwill"), total_assets)
+
+        data["Had_Goodwill_Impairment"] = (get_col("GoodwillImpairmentLoss") > 0).astype(int)
+
+        tax_base = get_col(
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"
+        )
+        data["Effective_Tax_Rate"] = safe_divide(get_col("IncomeTaxExpenseBenefit"), tax_base).clip(0.0,0.50)
+
         # Clean extreme inf / -inf values on calculated ratio columns only
         if hasattr(self, "ratio_columns") and self.ratio_columns:
             data[self.ratio_columns] = data[self.ratio_columns].replace(
@@ -379,8 +409,17 @@ class ModelBuilder:
                 "CapEx_To_CFO",
                 "CapEx_To_Revenue",
                 "R_And_D_To_Revenue",
+                "Accrual_Ratio",
+                "Payout_To_FCF",
+                "NonOperating_Income_Reliance",
+                "Goodwill_To_Assets",
+                "Had_Goodwill_Impairment",
+                "Effective_Tax_Rate"
             ]
-            data[ratio_cols] = data[ratio_cols].replace([np.inf, -np.inf], np.nan)
+
+            for col in ratio_cols:
+               if col in data.columns:
+                  data[col] = data[col].replace([np.inf, -np.inf], np.nan)
 
         return data
 
@@ -552,7 +591,7 @@ class ModelBuilder:
         data["Revenue_Acceleration"] = (
             data.groupby("Ticker")["Revenue_YoY_Growth"]
             .diff(1)
-            .clip(lower=-1.0, upper=1.0)
+            .clip(-1.0,1.0)
         )
 
         # -------------------------------------------------------------
@@ -586,6 +625,25 @@ class ModelBuilder:
         data["ROIC_YoY_Delta"] = safe_delta(data["Return_On_Equity"], 4)
         data["Working_Capital_YoY_Change"] = safe_pct_change(working_capital, 4)
 
+        # -------------------------------------------------------------
+        # 6. Fundamental Stability & Volatility (8-Quarter Rolling Window)
+        # -------------------------------------------------------------
+        # Pre-compute base metrics if not already present in the incoming DataFrame
+        if "Return_On_Equity" not in data.columns:
+            data["Return_On_Equity"] = safe_divide(net_income, stockholders_equity)
+        if "Net_Margin" not in data.columns:
+            data["Net_Margin"] = safe_divide(net_income, revenue)
+
+        data["ROE_Volatility_8Q"] = (
+            data.groupby("Ticker")["Return_On_Equity"]
+            .transform(lambda s: s.rolling(8, min_periods=4).std())
+        )
+
+        data["Margin_Volatility_8Q"] = (
+            data.groupby("Ticker")["Net_Margin"]
+            .transform(lambda s: s.rolling(8, min_periods=4).std())
+        )
+
         # Clean extreme inf / -inf values generated by zero division
         if hasattr(self, "trend_columns") and self.trend_columns:
             data[self.trend_columns] = data[self.trend_columns].replace(
@@ -610,6 +668,8 @@ class ModelBuilder:
                 "CapEx_YoY_Growth",
                 "ROIC_YoY_Delta",
                 "Working_Capital_YoY_Change",
+                "ROE_Volatility_8Q",
+                "Margin_Volatility_8Q"
             ]
             data[trend_cols] = data[trend_cols].replace([np.inf, -np.inf], np.nan)
 
