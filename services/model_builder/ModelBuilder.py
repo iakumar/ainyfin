@@ -1,785 +1,4054 @@
-import os
-import sys
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+"""
+AinyFin ModelBuilder
+--------------------
 
-import joblib
+Purpose:
+    Train and evaluate the AinyFin stock classification model.
+
+Architecture:
+    Fundamentals + Fundamental Trends + Market State
+                         |
+                         v
+                    XGBoost
+                         |
+                         v
+                 Buy / Hold / Sell
+                         |
+                         v
+            Probability + Confidence
+
+Important:
+    This class is deliberately designed for time-series financial data.
+
+    It does NOT use random train/test splitting for evaluation.
+    Primary validation is chronological / walk-forward.
+
+    Expected target:
+        bhsScore
+        1 = Sell
+        2 = Hold
+        3 = Buy
+
+    If your target mapping differs, change TARGET_LABELS below.
+"""
+
+from __future__ import annotations
+
+import os
+import warnings
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional, Tuple
+
 import numpy as np
 import pandas as pd
-import requests
-from pandas.tseries.holiday import USFederalHolidayCalendar
-from sklearn.metrics import accuracy_score, f1_score
-from sklearn.model_selection import StratifiedKFold, train_test_split
-from sklearn.preprocessing import LabelEncoder
+
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+)
+
 from xgboost import XGBClassifier
-from sklearn.metrics import classification_report, confusion_matrix
 from services.consts.AinySchema import AinySchema
 
-BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "anypug.appspot.com")
-DIRECTORY_NAME = "ainyfin/models"
-APP_ENGINE_URL = os.environ.get(
-    "APP_ENGINE_URL", "https://ainyfin.appspot.com"
-)
-GBMODEL_FILENAME = "gboost_bhs_model.joblib"
-XGBMODEL_FILENAME = "xgboost_bhs_model.joblib"
+warnings.filterwarnings("ignore")
+
+
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
+
+@dataclass
+class ModelConfig:
+
+    # -----------------------------------------------------------------
+    # Files
+    # -----------------------------------------------------------------
+
+    # ainyfin_data.csv is the daily price/target source.
+    training_file: str = f"{AinySchema.DATA_DIR}/ainyfin_data.csv"
+
+    # financial_data.csv is the authoritative SEC fundamental source.
+    financial_file: str = f"{AinySchema.DATA_DIR}/financial_data.csv"
+
+    model_file: str = "models/ainyfin_xgb_model.json"
+
+    # -----------------------------------------------------------------
+    # Target
+    # -----------------------------------------------------------------
+
+    target_column: str = "bhsScore"
+
+    # Your current mapping:
+    # 1 = Sell
+    # 2 = Hold
+    # 3 = Buy
+    #
+    # XGBoost requires zero-based class labels.
+    #
+    # Therefore:
+    #   Sell = 0
+    #   Hold = 1
+    #   Buy  = 2
+    target_labels: dict[int, str] = None
+
+    # -----------------------------------------------------------------
+    # Date / ticker
+    # -----------------------------------------------------------------
+
+    ticker_column: str = "Ticker"
+    date_column: str = "Date"
+
+    # -----------------------------------------------------------------
+    # Walk-forward validation
+    # -----------------------------------------------------------------
+
+    n_walk_forward_folds: int = 5
+
+    # Minimum training observations.
+    min_train_rows: int = 50000
+
+    # -----------------------------------------------------------------
+    # Chronological test
+    # -----------------------------------------------------------------
+
+    chronological_test_fraction: float = 0.20
+
+    # -----------------------------------------------------------------
+    # XGBoost
+    # -----------------------------------------------------------------
+
+    n_estimators: int = 600
+
+    max_depth: int = 6
+
+    learning_rate: float = 0.04
+
+    subsample: float = 0.80
+
+    colsample_bytree: float = 0.80
+
+    min_child_weight: int = 5
+
+    reg_alpha: float = 0.05
+
+    reg_lambda: float = 1.0
+
+    objective: str = "multi:softprob"
+
+    eval_metric: str = "mlogloss"
+
+    random_state: int = 42
+
+    n_jobs: int = -1
+
+    # -----------------------------------------------------------------
+    # Feature cleaning
+    # -----------------------------------------------------------------
+
+    clip_feature_min: float = -1e6
+
+    clip_feature_max: float = 1e6
+
+    # -----------------------------------------------------------------
+    # Signal
+    # -----------------------------------------------------------------
+
+    # These are deliberately NOT used as model-training thresholds.
+    # They are only reporting defaults.
+    no_trade_confidence: float = 0.50
+
+
+# ---------------------------------------------------------------------
+# Main ModelBuilder
+# ---------------------------------------------------------------------
 
 class ModelBuilder:
-    def __init__(self, builder: str, n_estimators: int = 100):
-        self.target_column:str = "bhsScore"
-        self.symbols:list[str] = []
-        # Explicit list of generated ratio columns
-        self.ratio_columns:list[str] = [
+    """
+    AinyFin model training / validation / prediction engine.
+    """
+
+    def __init__(self, builder: str):
+        self.builder = builder
+        self.config = ModelConfig()
+
+        if self.config.target_labels is None:
+            self.config.target_labels = {
+                0: "SELL",
+                1: "HOLD",
+                2: "BUY",
+            }
+
+        # -------------------------------------------------------------
+        # Model features
+        # -------------------------------------------------------------
+
+        self.snapshot_columns = [
+
+            # ---------------------------------------------------------
+            # Valuation
+            # ---------------------------------------------------------
+
             "Price_To_Earnings",
             "Price_To_FreeCashFlow",
             "Price_To_Book",
             "Price_To_Sales",
+
             "EV_To_EBITDA",
             "EV_To_EBIT",
+
+            # ---------------------------------------------------------
+            # Profitability
+            # ---------------------------------------------------------
+
             "Gross_Margin",
             "Net_Margin",
             "FCF_Margin",
             "Operating_Margin",
             "EBITDA_Margin",
+
             "Return_On_Equity",
             "Return_On_Assets",
+            "Return_On_Invested_Capital",
+
+            # ---------------------------------------------------------
+            # Leverage / liquidity
+            # ---------------------------------------------------------
+
             "Debt_To_Equity",
             "Debt_To_Assets",
+
             "Current_Ratio",
             "Quick_Ratio",
+
             "Interest_Coverage",
             "Cash_To_Debt",
+
+            "Net_Debt_To_EBITDA",
+
+            # ---------------------------------------------------------
+            # Efficiency
+            # ---------------------------------------------------------
+
             "Asset_Turnover",
             "Working_Capital_Turnover",
+
+            # ---------------------------------------------------------
+            # Cash flow quality
+            # ---------------------------------------------------------
+
             "CFO_To_NetIncome",
-            "SBC_To_Revenue",
             "CapEx_To_CFO",
             "CapEx_To_Revenue",
-            "R_And_D_To_Revenue",
+
+            # ---------------------------------------------------------
+            # Accounting / quality
+            # ---------------------------------------------------------
+
+            "SBC_To_Revenue",
             "Accrual_Ratio",
-            "Payout_To_FCF",
-            "NonOperating_Income_Reliance",
+
             "Goodwill_To_Assets",
-            "Effective_Tax_Rate"
+            "Intangibles_Plus_Goodwill_To_Assets",
+
+            "Effective_Tax_Rate",
+            "NonOperating_Income_Reliance",
+
+            # ---------------------------------------------------------
+            # Capital allocation
+            # ---------------------------------------------------------
+
+            "Payout_To_FCF",
+            "Buyback_To_FCF",
+            "Reinvestment_Rate",
+
+            # ---------------------------------------------------------
+            # Other fundamental indicators
+            # ---------------------------------------------------------
+
+            "R_And_D_To_Revenue",
+            "SGA_Intensity",
+
+            "Retained_Earnings_To_Assets",
+            "AOCI_To_Equity",
+
+            "Operating_Lease_To_Assets",
+
+            "Deferred_Tax_To_NetIncome",
+            "Cash_Vs_Book_Tax_Gap",
+
+            "Dividend_Yield",
+            "Dividend_Per_Share_YoY_Growth",
+            "Buyback_Yield",
+
+            "Had_Goodwill_Impairment",
         ]
 
-        # Collect trend feature columns for inf handling
-        self.trend_columns:list[str] = [
+        # -------------------------------------------------------------
+        # Fundamental trend features
+        # -------------------------------------------------------------
+
+        self.trend_columns = [
+
             "Revenue_YoY_Growth",
             "Revenue_QoQ_Growth",
-            "EBITDA_YoY_Growth",
+            "Revenue_Acceleration",
+
+            "NetIncome_YoY_Growth",
             "EPS_YoY_Growth",
+            "EBITDA_YoY_Growth",
             "FCF_YoY_Growth",
             "Operating_CashFlow_YoY_Growth",
-            "Revenue_Acceleration",
+
             "Gross_Margin_YoY_Delta",
             "EBITDA_Margin_YoY_Delta",
             "FCF_Margin_YoY_Delta",
             "Operating_Margin_QoQ_Delta",
-            "Debt_YoY_Growth",
-            "Shares_Outstanding_YoY_Change",
-            "CapEx_YoY_Growth",
+
+            "ROA_YoY_Delta",
+            "ROE_YoY_Delta",
+
+            # Correctly calculated ROIC trend.
             "ROIC_YoY_Delta",
+
+            "Debt_YoY_Growth",
+
+            "Shares_Outstanding_YoY_Change",
+
+            "CapEx_YoY_Growth",
+
             "Working_Capital_YoY_Change",
+
             "ROE_Volatility_8Q",
-            "Margin_Volatility_8Q"
+            "Margin_Volatility_8Q",
+
+            # Working capital / operating efficiency
+            "DSO",
+            "DIO",
+            "DPO",
+
+            "AR_Growth_vs_Revenue_Growth",
+            "Inventory_Growth_vs_Revenue_Growth",
+
+            "Cash_Conversion_Cycle",
+
+            "Billings_Proxy_YoY",
+
+            "Deferred_Revenue_To_Revenue",
+            "Deferred_Revenue_YoY_Growth",
+
+            "Acquisition_Intensity",
+
+            "Net_Debt_Issuance_To_Assets",
+
+            "Realized_Vol_60D",
+
+            "Daily_Range_Pct",
+
+            "Dollar_Volume_Log",
+            "Volume_Vs_60D_Avg",
+
+            "Momentum_1M",
+            "Momentum_3M",
+            "Momentum_12M_1M",
+
+            "Price_Vs_52W_High",
+
         ]
 
-        self.training_columns:list[str] = self.ratio_columns + self.trend_columns + ["bhsScore"]
-        #print("training_columns:", self.training_columns)
-        self.builder:str = builder
-        self.n_estimators:int = n_estimators
-        self.xg_model:any = None
+        # -------------------------------------------------------------
+        # Sector normalized features
+        # -------------------------------------------------------------
+        #
+        # These are retained because they are already part of your
+        # current architecture.
+        #
+        # IMPORTANT:
+        # Sector normalization should be performed using only
+        # information available at that date.
+        #
+        # The method below normalizes cross-sectionally by date/sector
+        # when Sector is available.
+        # -------------------------------------------------------------
 
+        self.sector_base_columns = [
 
-    def getMostRecentMarketDate(self):
-        # Check if current time is greater than 4 PM EST
-        est_tz = timezone(timedelta(hours=-4))
-        current_time = datetime.now().astimezone()
-        target_time = datetime(
-            current_time.year,
-            current_time.month,
-            current_time.day,
-            17,
+            "Revenue_YoY_Growth",
+            "EPS_YoY_Growth",
+            "EBITDA_YoY_Growth",
+            "FCF_YoY_Growth",
+
+            "Gross_Margin",
+            "Net_Margin",
+            "Operating_Margin",
+            "FCF_Margin",
+
+            "Gross_Margin_YoY_Delta",
+            "EBITDA_Margin_YoY_Delta",
+            "FCF_Margin_YoY_Delta",
+            "Operating_Margin_QoQ_Delta",
+
+            "ROA_YoY_Delta",
+            "ROE_YoY_Delta",
+
+            "Debt_To_Assets",
+            "Debt_To_Equity",
+
+            "Price_To_Earnings",
+            "Price_To_Sales",
+            "Price_To_Book",
+            "Price_To_FreeCashFlow",
+
+            "CapEx_YoY_Growth",
+
+            "Working_Capital_Turnover",
+            "Working_Capital_YoY_Change",
+
+            "Margin_Volatility_8Q",
+            "ROE_Volatility_8Q",
+
+            "Cash_To_Debt",
+
+            "Net_Debt_To_EBITDA",
+
+            "EV_To_EBITDA",
+            "EV_To_EBIT",
+
+            "FCF_Margin",
+
+            "Asset_Turnover",
+
+            "Cash_Conversion_Cycle",
+
+            "DSO",
+            "DIO",
+            "DPO",
+
+            "R_And_D_To_Revenue",
+
+            "Billings_Proxy_YoY",
+
+            "Reinvestment_Rate",
+
+            "Buyback_Yield",
+
+            "Dividend_Yield",
+
+            "Intangibles_Plus_Goodwill_To_Assets",
+
+            "Deferred_Revenue_To_Revenue",
+
+        ]
+
+        # Remove accidental duplicates while preserving order.
+        self.available_training_columns = list(dict.fromkeys(self.snapshot_columns + self.trend_columns))
+
+        self.model:XGBClassifier = None
+
+        self.feature_importance:pd.DataFrame = None
+
+        self.feature_columns: list[str] = []
+        print(
+            f"ModelBuilder initialized with "
+            f"{len(self.available_training_columns)} model features."
+        )
+
+    # =================================================================
+    # Utility methods
+    # =================================================================
+
+    @staticmethod
+    def _safe_divide(
+        numerator,
+        denominator,
+        default=np.nan,
+    ):
+        """
+        Safe element-wise division.
+        """
+
+        numerator = pd.to_numeric(
+            numerator,
+            errors="coerce",
+        )
+
+        denominator = pd.to_numeric(
+            denominator,
+            errors="coerce",
+        )
+
+        result = numerator / denominator.replace(
             0,
-            0,
-            tzinfo=est_tz,
+            np.nan,
         )
 
-        us_market_bday = pd.tseries.offsets.CustomBusinessDay(calendar=USFederalHolidayCalendar())
-        print("us_market_bday:",us_market_bday)
-        # Convert to pandas Timestamps to make calendar math work perfectly
-        current_ts = pd.Timestamp(current_time)
-        target_ts = pd.Timestamp(target_time)
+        if default is not np.nan:
+            result = result.fillna(default)
 
-        # Rule 1: Weekends & Holidays (Sat/Sun/Holidays always roll backward to prior trading day)
-        if not us_market_bday.is_on_offset(target_ts):
-            predict_date = target_ts - us_market_bday
+        return result
 
-        # Rule 2: It is Monday (or the first trading day of the week) and we haven't reached target_time yet
-        elif target_ts.weekday() == 0 and current_ts < target_ts:
-            predict_date = target_ts - us_market_bday # Rolls back 2 trading days (e.g., past Friday to Thursday)
-            print("predict_date 2:", predict_date, current_ts, target_ts)
+    @staticmethod
+    def _winsorize_series(
+        series: pd.Series,
+        lower: float = 0.01,
+        upper: float = 0.99,
+    ) -> pd.Series:
 
-        # Rule 3: target_time is in the past, and it is a valid weekday/trading day
-        elif current_ts > target_ts:
-            predict_date = target_ts
-            print("predict_date 3:", predict_date)
+        if series.dropna().empty:
+            return series
 
-        # Rule 4: Normal weekdays (Tue-Fri) where current_time hasn't reached target_time yet
-        else:
-            predict_date = target_ts - us_market_bday
-            print("predict_date 4:", predict_date)
+        low = series.quantile(lower)
+        high = series.quantile(upper)
 
-        predict_date_end = predict_date + timedelta(days=1)
-        return predict_date, predict_date_end
+        return series.clip(
+            lower=low,
+            upper=high,
+        )
 
+    @staticmethod
+    def _yoy(series: pd.Series) -> pd.Series:
 
-    def load_train_data(self) -> pd.DataFrame:
+        return series.pct_change(
+            periods=4
+        )
+
+    @staticmethod
+    def _qoq(series: pd.Series) -> pd.Series:
+
+        return series.pct_change(
+            periods=1
+        )
+
+    @staticmethod
+    def _delta(
+        series: pd.Series,
+        periods: int = 4,
+    ) -> pd.Series:
+
+        return series - series.shift(periods)
+
+    @staticmethod
+    def _rolling_volatility(
+        series: pd.Series,
+        window: int = 8,
+    ) -> pd.Series:
+
+        return series.rolling(
+            window=window,
+            min_periods=max(3, window // 2),
+        ).std()
+
+    # =================================================================
+    # Correct ROIC
+    # =================================================================
+
+    def compute_roic(
+        self,
+        data: pd.DataFrame,
+    ) -> pd.Series:
         """
-        Fetch your historical training feature dataset...
-        """
-        print("Loading ainyfin_data training feature dataset...")
-        raw_df = pd.read_csv(AinySchema.DATA_DIR+'/ainyfin_data.csv')
-        raw_df = raw_df.sort_values(['Ticker','Date'])
-        snapshot_df = self.compute_financial_snapshot(raw_df)
-        snapshot_df.to_csv(AinySchema.DATA_DIR+'/snapshot.csv')
-        snapshot_df[['Ticker', "bhsScore"]] = raw_df[['Ticker', "bhsScore"]].replace([np.inf, -np.inf], np.nan)
-        snapshot_df['Date'] = pd.to_datetime(snapshot_df['Date'])
-        snapshot_df = snapshot_df.sort_values(['Date']).reset_index(drop=True)
+        Calculate actual ROIC.
 
-        financial_df = pd.read_csv(AinySchema.DATA_DIR+'/financial_data.csv')
-        financial_df['Date'] = pd.to_datetime(financial_df['Date'])
-        financial_df = financial_df.sort_values(['Ticker','Date']).reset_index(drop=True)
-        financial_trends_df = self.compute_financial_trends(financial_df)
-        financial_trends_df = financial_trends_df.sort_values(['Date']).reset_index(drop=True)
-        financial_trends_df.to_csv(AinySchema.DATA_DIR+'/trends.csv')
+        ROIC ≈ NOPAT / Invested Capital
 
-        merged_df = pd.merge_asof(snapshot_df, financial_trends_df, left_on='Date', right_on='Date',
-                                  by='Ticker', direction='backward', suffixes=('', '_Trends'))
-        self.symbols = merged_df['Ticker'].unique().tolist()
-        return merged_df
+        NOPAT:
+            EBIT * (1 - effective tax rate)
 
+        Invested capital:
+            Debt + Equity - Cash
 
+        This intentionally does NOT use ROE.
 
-    def compute_financial_snapshot(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Computes standardized valuation, leverage, profitability, and quality ratios
-        from raw SEC fundamental and market price data.
+        Previous versions had ROIC_YoY_Delta derived from ROE,
+        which made the feature name misleading.
         """
 
-        def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
-            """Performs element-wise division, returning np.nan for invalid or zero denominator."""
-            denom_clean = denominator.replace(0, np.nan)
-            result = numerator / denom_clean
-            return result.replace([np.inf, -np.inf], np.nan)
-
-        def get_col(col_name: str, fallback_val=np.nan) -> pd.Series:
-            """Safely fetch a column or return a default series if missing."""
-            if col_name in data.columns:
-                # Coerce non-numeric or missing entries cleanly to float
-                return pd.to_numeric(data[col_name], errors="coerce")
-            return pd.Series(fallback_val, index=data.index)
-
-        # Prevent mutating input
-        data = df.copy()
-
-        # =========================================================================
-        # PRE-COMPUTATION & TAG MAPPINGS
-        # =========================================================================
-
-        # 1. Total Revenue (Chained SEC XBRL Tags)
-        revenue = (
-            get_col("RevenueFromContractWithCustomerExcludingAssessedTax")
-            .where(lambda x: x.notna() & (x != 0), get_col("Revenues"))
-            .where(lambda x: x.notna() & (x != 0), get_col("SalesRevenueNet"))
+        ebit = self._first_existing(
+            data,
+            [
+                "OperatingIncome",
+                "Operating_Income",
+                "EBIT",
+                "OperatingIncomeLoss",
+            ],
         )
 
-        # 2. Net Income
-        net_income = get_col("NetIncomeLoss").where(
-            lambda x: x.notna() & (x != 0), get_col("ProfitLoss")
+        debt = self._first_existing(
+            data,
+            [
+                "TotalDebt",
+                "Debt",
+                "LongTermDebt",
+                "LongTermDebtNoncurrent",
+                "LongTermDebtCurrent",
+            ],
         )
 
-        # 3. Balance Sheet Aggregates
-        total_assets = get_col("Assets")
-        current_assets = get_col("AssetsCurrent")
-        current_liabilities = get_col("LiabilitiesCurrent")
-        stockholders_equity = get_col("StockholdersEquity")
-
-        # 4. Total Debt & Liquidity
-        total_debt = get_col("TotalDebt").where(
-            lambda x: x.notna() & (x != 0),
-            get_col("LongTermDebtCurrent").fillna(0) + get_col("LongTermDebtNoncurrent").fillna(0),
+        equity = self._first_existing(
+            data,
+            [
+                "StockholdersEquity",
+                "Stockholders_Equity",
+                "StockholdersEquityAbstract",
+                "TotalEquity",
+                "Equity",
+            ],
         )
 
-        cash_and_equivalents = get_col(
-            "CashCashEquivalentsAndShortTermInvestments"
-        ).where(
-            lambda x: x.notna() & (x != 0),
-            get_col("CashCashEquivalentsAtCarryingValue").fillna(0)
-            + get_col("ShortTermInvestments").fillna(0),
+        cash = self._first_existing(
+            data,
+            [
+                "CashAndCashEquivalents",
+                "CashAndShortTermInvestments",
+                "CashCashEquivalentsAndShortTermInvestments",
+                "CashAndCashEquivalentsAtCarryingValue",
+            ],
         )
 
-        accounts_receivable = get_col("AccountsReceivableNetCurrent").where(
-            lambda x: x.notna() & (x != 0), get_col("AccountsReceivableNet")
+        tax_rate = self._first_existing(
+            data,
+            [
+                "Effective_Tax_Rate",
+                "Cash_Tax_Rate",
+            ],
         )
 
-        # 5. Earnings Metrics (EBIT & Normalized EBITDA)
-        operating_income = get_col("OperatingIncomeLoss").where(
-            lambda x: x.notna() & (x != 0),
-            get_col("OperatingIncome").where(
-                lambda x: x.notna() & (x != 0),
-                revenue - get_col("OperatingExpenses")
+        if ebit is None:
+            return pd.Series(
+                np.nan,
+                index=data.index,
+                name="Return_On_Invested_Capital",
+            )
+
+        if debt is None:
+            debt = pd.Series(
+                0.0,
+                index=data.index,
+            )
+
+        if equity is None:
+            return pd.Series(
+                np.nan,
+                index=data.index,
+                name="Return_On_Invested_Capital",
+            )
+
+        if cash is None:
+            cash = pd.Series(
+                0.0,
+                index=data.index,
+            )
+
+        if tax_rate is None:
+            tax_rate = pd.Series(
+                0.21,
+                index=data.index,
+            )
+
+        tax_rate = pd.to_numeric(
+            tax_rate,
+            errors="coerce",
+        )
+
+        # Prevent pathological tax rates from destroying ROIC.
+        tax_rate = tax_rate.clip(
+            lower=0.0,
+            upper=0.50,
+        )
+
+        nopat = (
+            pd.to_numeric(
+                ebit,
+                errors="coerce",
+            )
+            * (1.0 - tax_rate)
+        )
+
+        invested_capital = (
+            pd.to_numeric(
+                debt,
+                errors="coerce",
+            )
+            +
+            pd.to_numeric(
+                equity,
+                errors="coerce",
+            )
+            -
+            pd.to_numeric(
+                cash,
+                errors="coerce",
             )
         )
 
-        # Fixed syntax chaining for interest expense
-        interest_expense = get_col("InterestExpense").where(
-            lambda x: x.notna() & (x != 0),
-            get_col("InterestExpenseNonoperating").where(
-                lambda x: x.notna() & (x != 0),
-                get_col("InterestExpenseOperating")
+        invested_capital = invested_capital.where(
+            invested_capital > 0
+        )
+
+        roic = self._safe_divide(
+            nopat,
+            invested_capital,
+        )
+
+        return roic.clip(
+            lower=-5.0,
+            upper=5.0,
+        )
+
+    # =================================================================
+    # Column helpers
+    # =================================================================
+
+    @staticmethod
+    def _first_existing(
+        data: pd.DataFrame,
+        candidates: list[str],
+    ):
+        for column in candidates:
+            if column in data.columns:
+                series = data[column]
+
+                # Prefer the first candidate that actually contains data
+                if series.notna().any():
+                    return series
+
+        return None
+
+    # =================================================================
+    # Fundamental snapshot
+    # =================================================================
+
+    def compute_financial_snapshot(
+        self,
+        data: pd.DataFrame,
+    ) -> pd.DataFrame:
+
+        data = data.copy()
+
+        # -------------------------------------------------------------
+        # Basic numeric conversion
+        # -------------------------------------------------------------
+
+        for column in data.columns:
+            if column in [
+                self.config.ticker_column,
+                self.config.date_column,
+                "Sector",
+            ]:
+                continue
+
+            if (data[column].dtype == "object"):
+                data[column] = pd.to_numeric(
+                    data[column],
+                    errors="coerce",
+                )
+
+        # -------------------------------------------------------------
+        # Profitability
+        # -------------------------------------------------------------
+
+        revenue = self._first_existing(
+            data,
+            [
+                "RevenueFromContractWithCustomerExcludingAssessedTax",  # Primary ASC 606 GAAP tag
+                "Revenues",                                             # Aggregate GAAP tag
+                "SalesRevenueNet",                                      # Standard product/service sales tag
+                "TotalRevenue_Consolidated",                            # Consolidated dataset tag
+                "RevenueFromContractWithCustomerIncludingAssessedTax", # Alternative ASC 606 tag
+            ],
+        )
+
+        gross_profit = self._first_existing(
+            data,
+            [
+                "GrossProfit",
+                "Gross_Profit",
+            ],
+        )
+
+        operating_income = self._first_existing(
+            data,
+            [
+                "OperatingIncome",
+                "Operating_Income",
+                "OperatingIncomeLoss",
+            ],
+        )
+
+        net_income = self._first_existing(
+            data,
+            [
+                "NetIncome",
+                "NetIncomeLoss",
+            ],
+        )
+
+        ebitda = self._first_existing(
+            data,
+            [
+                "EBITDA",
+                "EBITDA_Calculated",
+            ],
+        )
+
+        fcf = self._first_existing(
+            data,
+            [
+                "FreeCashFlow",
+                "FCF",
+            ],
+        )
+
+        # financial_data.csv does not contain a standard EBITDA column.
+        # Derive EBITDA when possible from operating income plus D&A.
+        if ebitda is None and operating_income is not None:
+            da = self._first_existing(
+                data,
+                [
+                    "DepreciationAndAmortization",
+                    "DepreciationDepletionAndAmortization",
+                    "DepreciationAmortizationAndAccretionNet",
+                    "Depreciation",
+                ],
             )
+            if da is not None:
+                data["EBITDA_Calculated"] = (
+                    pd.to_numeric(operating_income, errors="coerce")
+                    + pd.to_numeric(da, errors="coerce").abs()
+                )
+                ebitda = data["EBITDA_Calculated"]
+
+        if revenue is not None:
+
+            data["Gross_Margin"] = (
+                self._safe_divide(
+                    gross_profit,
+                    revenue,
+                )
+                if gross_profit is not None
+                else np.nan
+            )
+
+            data["Operating_Margin"] = (
+                self._safe_divide(
+                    operating_income,
+                    revenue,
+                )
+                if operating_income is not None
+                else np.nan
+            )
+
+            data["Net_Margin"] = (
+                self._safe_divide(
+                    net_income,
+                    revenue,
+                )
+                if net_income is not None
+                else np.nan
+            )
+
+            data["FCF_Margin"] = (
+                self._safe_divide(
+                    fcf,
+                    revenue,
+                )
+                if fcf is not None
+                else np.nan
+            )
+
+            data["EBITDA_Margin"] = (
+                self._safe_divide(
+                    ebitda,
+                    revenue,
+                )
+                if ebitda is not None
+                else np.nan
+            )
+
+        # -------------------------------------------------------------
+        # Balance sheet
+        # -------------------------------------------------------------
+
+        equity = self._first_existing(
+            data,
+            [
+                "StockholdersEquity",
+                "Stockholders_Equity",
+                "StockholdersEquityAbstract",
+                "TotalEquity",
+                "Equity",
+            ],
         )
 
-        ebit = operating_income.where(
-            lambda x: x.notna() & (x != 0),
-            net_income.fillna(0) + interest_expense.fillna(0)
+        assets = self._first_existing(
+            data,
+            [
+                "Assets",
+                "TotalAssets",
+            ],
         )
 
-        # Expanded D&A tag resolution
-        dna = get_col("DepreciationDepletionAndAmortization").where(
-            lambda x: x.notna() & (x != 0),
-            get_col("DepreciationAndAmortization").where(
-                lambda x: x.notna() & (x != 0),
-                get_col("DepreciationAmortizationAndAccretion").where(
-                    lambda x: x.notna() & (x != 0),
-                    get_col("Depreciation").fillna(0) + get_col("AmortizationOfIntangibleAssets").fillna(0)
+        current_assets = self._first_existing(
+            data,
+            [
+                "AssetsCurrent",
+                "CurrentAssets",
+            ],
+        )
+
+        current_liabilities = self._first_existing(
+            data,
+            [
+                "LiabilitiesCurrent",
+                "CurrentLiabilities",
+            ],
+        )
+
+        total_debt = self._first_existing(
+            data,
+            [
+                "TotalDebt",
+                "Debt",
+            ],
+        )
+
+        cash = self._first_existing(
+            data,
+            [
+                "CashAndCashEquivalents",
+                "CashAndCashEquivalentsAtCarryingValue",
+                "CashCashEquivalentsAndShortTermInvestments",
+                "Cash",
+                "CashAndShortTermInvestments",
+            ],
+        )
+
+        if equity is not None:
+
+            data["Return_On_Equity"] = (
+                self._safe_divide(
+                    net_income,
+                    equity,
+                )
+                if net_income is not None
+                else np.nan
+            )
+
+        if assets is not None:
+
+            data["Return_On_Assets"] = (
+                self._safe_divide(
+                    net_income,
+                    assets,
+                )
+                if net_income is not None
+                else np.nan
+            )
+
+        if total_debt is not None and equity is not None:
+
+            data["Debt_To_Equity"] = self._safe_divide(
+                total_debt,
+                equity,
+            )
+
+        if total_debt is not None and assets is not None:
+
+            data["Debt_To_Assets"] = self._safe_divide(
+                total_debt,
+                assets,
+            )
+
+        if current_assets is not None and current_liabilities is not None:
+
+            data["Current_Ratio"] = self._safe_divide(
+                current_assets,
+                current_liabilities,
+            )
+
+            working_capital = (
+                current_assets
+                - current_liabilities
+            )
+
+            data["_Working_Capital"] = working_capital
+
+        # -------------------------------------------------------------
+        # Quick ratio
+        # -------------------------------------------------------------
+
+        inventory = self._first_existing(
+            data,
+            [
+                "Inventory",
+                "InventoryNet",
+            ],
+        )
+
+        if (
+            current_assets is not None
+            and current_liabilities is not None
+        ):
+
+            if inventory is not None:
+
+                quick_assets = (
+                    current_assets
+                    - inventory
+                )
+
+            else:
+
+                quick_assets = current_assets
+
+            data["Quick_Ratio"] = self._safe_divide(
+                quick_assets,
+                current_liabilities,
+            )
+
+            interest_expense = self._first_existing(data, ["InterestExpense",
+                                                           "InterestExpenseNonoperating",
+                                                           "InterestExpenseDebt",
+                                                           "FinancingInterestExpense"])
+            if interest_expense is not None and ebitda is not None:
+                data["Interest_Coverage"] = self._safe_divide(
+                    ebitda,
+                    pd.to_numeric(interest_expense, errors="coerce").abs()
+                ).clip(-50.0, 100.0)
+
+        # -------------------------------------------------------------
+        # Cash / debt
+        # -------------------------------------------------------------
+
+        if cash is not None and total_debt is not None:
+
+            data["Cash_To_Debt"] = self._safe_divide(
+                cash,
+                total_debt,
+            )
+
+            data["_Net_Debt"] = (
+                total_debt - cash
+            )
+
+        # -------------------------------------------------------------
+        # Working capital turnover
+        # -------------------------------------------------------------
+
+        if (
+            revenue is not None
+            and "_Working_Capital" in data.columns
+        ):
+
+            wc = data["_Working_Capital"]
+
+            # Avoid pathological ratios caused by near-zero WC.
+            wc = wc.where(
+                wc.abs() > 1e-9
+            )
+
+            data["Working_Capital_Turnover"] = (
+                self._safe_divide(
+                    revenue,
+                    wc,
                 )
             )
-        )
 
-        # Fixed syntax chaining for Share-Based Compensation
-        sbc = get_col("ShareBasedCompensation").where(
-            lambda x: x.notna() & (x != 0),
-            get_col("SharebasedCompensationArrangementBySharebasedPaymentAwardCompensationCost1").where(
-                lambda x: x.notna() & (x != 0),
-                get_col("AllocatedShareBasedCompensationExpense")
+        # -------------------------------------------------------------
+        # Asset turnover
+        # -------------------------------------------------------------
+
+        if revenue is not None and assets is not None:
+
+            data["Asset_Turnover"] = self._safe_divide(
+                revenue,
+                assets,
             )
-        )
-
-        restructuring = get_col("RestructuringCosts").where(
-            lambda x: x.notna() & (x != 0),
-            get_col("RestructuringAndRelatedCostIncurredCost"),
-        )
-
-        impairments = (
-            get_col("GoodwillImpairmentLoss").fillna(0)
-            + get_col("ImpairmentOfIntangibleAssetsExcludingGoodwill").fillna(0)
-            + get_col("InventoryWriteDown").fillna(0)
-        )
-
-        gains_losses = (
-            get_col("GainLossOnSaleOfPropertyPlantEquipment").fillna(0)
-            + get_col("GainLossOnSaleOfBusiness").fillna(0)
-            + get_col("EquitySecuritiesFvNiGainLoss").fillna(0)
-        )
-
-        ebitda_base = operating_income.fillna(0) + dna.fillna(0)
-        normalized_ebitda = (
-            ebitda_base
-            + sbc.fillna(0)
-            + restructuring.fillna(0)
-            + impairments
-            - gains_losses
-        ).where(lambda x: x != 0, ebitda_base)
-
-        # 6. Expenses & Cash Flows
-        gross_profit = get_col("GrossProfit").where(
-            lambda x: x.notna() & (x != 0), get_col("GrossProfit_Calculated")
-        )
-
-        cfo = get_col("NetCashProvidedByUsedInOperatingActivities")
-        capex = get_col("PaymentsToAcquirePropertyPlantAndEquipment").abs()
-        fcf = get_col("FreeCashFlow").where(lambda x: x.notna() & (x != 0), cfo - capex)
-        rd_expense = get_col("ResearchAndDevelopmentExpense")
-
-        # Share Count and Market Cap
-        shares_diluted = get_col(
-            "WeightedAverageNumberOfDilutedSharesOutstanding"
-        ).where(
-            lambda x: x.notna() & (x != 0),
-            get_col("WeightedAverageNumberOfSharesOutstandingBasic"),
-        )
-        market_cap = get_col("Close") * shares_diluted
-        enterprise_value = market_cap + total_debt.fillna(0) - cash_and_equivalents.fillna(0)
-
-        # =========================================================================
-        # COMPUTED FINANCIAL RATIOS
-        # =========================================================================
-
-        # 1. Valuation Ratios
-        data["Price_To_Earnings"] = safe_divide(data["Close"], get_col("EarningsPerShareDiluted"))
-        data["Price_To_FreeCashFlow"] = safe_divide(market_cap, fcf)
-        data["Price_To_Book"] = safe_divide(market_cap, stockholders_equity)
-        data["Price_To_Sales"] = safe_divide(market_cap, revenue)
-        data["EV_To_EBITDA"] = safe_divide(enterprise_value, normalized_ebitda)
-        data["EV_To_EBIT"] = safe_divide(enterprise_value, ebit)
-
-        # 2. Profitability & Margins
-        data["Gross_Margin"] = safe_divide(gross_profit, revenue)
-        data["Operating_Margin"] = safe_divide(operating_income, revenue)
-        data["EBITDA_Margin"] = safe_divide(normalized_ebitda, revenue)
-        data["Net_Margin"] = safe_divide(net_income, revenue)
-        data["FCF_Margin"] = safe_divide(fcf, revenue)
-        data["Return_On_Equity"] = safe_divide(net_income, stockholders_equity)
-        data["Return_On_Assets"] = safe_divide(net_income, total_assets)
-
-        # 3. Leverage, Solvency & Liquidity
-        data["Debt_To_Equity"] = safe_divide(total_debt, stockholders_equity)
-        data["Debt_To_Assets"] = safe_divide(total_debt, total_assets)
-        data["Current_Ratio"] = safe_divide(current_assets, current_liabilities)
-        data["Quick_Ratio"] = safe_divide(
-            cash_and_equivalents + accounts_receivable, current_liabilities
-        )
-        data["Interest_Coverage"] = safe_divide(ebit, interest_expense.abs())
-        data["Cash_To_Debt"] = safe_divide(cash_and_equivalents, total_debt)
-
-        # 4. Operational Efficiency
-        data["Asset_Turnover"] = safe_divide(revenue, total_assets)
-        data["Working_Capital_Turnover"] = safe_divide(revenue, get_col("WorkingCapital"))
-
-        # 5. Earnings Quality & Capital Allocation
-        data["CFO_To_NetIncome"] = safe_divide(cfo, net_income)
-        data["SBC_To_Revenue"] = safe_divide(sbc, revenue)
-        data["CapEx_To_CFO"] = safe_divide(capex, cfo)
-        data["CapEx_To_Revenue"] = safe_divide(capex, revenue)
-        data["R_And_D_To_Revenue"] = safe_divide(rd_expense, revenue)
-
-        # Earnings Quality Signals
-        data["Accrual_Ratio"] = safe_divide(net_income - cfo, total_assets)
-        data["Payout_To_FCF"] = safe_divide(
-            get_col("PaymentsOfDividendsCommonStock").abs().fillna(0)
-            + get_col("PaymentsForRepurchaseOfCommonStock").abs().fillna(0),
-            fcf,
-        ).clip(-5.0, 5.0)
-
-        data["NonOperating_Income_Reliance"] = safe_divide(
-            get_col("OtherNonoperatingIncomeExpense").abs(), net_income.abs()
-        )
-
-        data["Goodwill_To_Assets"] = safe_divide(get_col("Goodwill"), total_assets)
-
-        impairment_col = "GoodwillImpairmentLoss"
-        if impairment_col in data.columns:
-            data["Had_Goodwill_Impairment"] = (data[impairment_col].fillna(0) > 0).astype(int)
-        else:
-            data["Had_Goodwill_Impairment"] = np.nan
-
-        tax_base = get_col(
-            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"
-        )
-        data["Effective_Tax_Rate"] = safe_divide(get_col("IncomeTaxExpenseBenefit"), tax_base).clip(0.0, 0.50)
-
-        return data
-
-
-    def compute_financial_trends(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Computes quarterly YoY momentum, acceleration, and margin delta signals
-
-        from raw fundamental line items and calculated ratios.
-        """
-        data = df.copy()
-        data = data.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-
-        def _get_col(name: str, fallback=0.0) -> pd.Series:
-            if name in data.columns:
-                return data[name].fillna(fallback)
-            return pd.Series(fallback, index=data.index)
-
-        def _safe_divide(num: pd.Series, den: pd.Series) -> pd.Series:
-            res = np.where((den == 0) | den.isna(), np.nan, num / den)
-            return pd.Series(res, index=data.index)
-
-        grouped = data.groupby("Ticker")
-
-        def _pct_change(series: pd.Series, periods: int) -> pd.Series:
-            if series.name and series.name in data.columns:
-                prev = grouped[series.name].shift(periods)
-            else:
-                prev = series.groupby(data["Ticker"]).shift(periods)
-            denom = prev.abs()
-            res = (series - prev).divide(denom).where((denom != 0) & denom.notna(), np.nan)
-            return pd.Series(res, index=data.index)
-
-        def _delta(series: pd.Series, periods: int) -> pd.Series:
-            if series.name and series.name in data.columns:
-                prev = grouped[series.name].shift(periods)
-            else:
-                prev = series.groupby(data["Ticker"]).shift(periods)
-            return pd.Series(series - prev, index=data.index)
 
         # -------------------------------------------------------------
-        # BASE VARIABLE MAPPINGS & FALLBACK DERIVATIONS
+        # Free cash flow conversion
         # -------------------------------------------------------------
-        rev_contract = _get_col("RevenueFromContractWithCustomerExcludingAssessedTax")
-        rev_gen = _get_col("Revenues")
-        revenue = pd.Series(np.where(rev_contract != 0, rev_contract, rev_gen), index=data.index, name="Revenue")
 
-        net_inc_raw = _get_col("NetIncomeLoss")
-        profit_loss = _get_col("ProfitLoss")
-        net_income = pd.Series(np.where(net_inc_raw != 0, net_inc_raw, profit_loss), index=data.index, name="NetIncome")
-
-        dna = _get_col("DepreciationDepletionAndAmortization")
-        dna_alt = _get_col("DepreciationAndAmortization")
-        dna_sum = _get_col("Depreciation") + _get_col("AmortizationOfIntangibleAssets")
-        dna_final = pd.Series(np.where(dna != 0, dna, np.where(dna_alt != 0, dna_alt, dna_sum)), index=data.index, name="DNA")
-
-        cfo = _get_col("NetCashProvidedByUsedInOperatingActivities").rename("CFO")
-        capex = _get_col("PaymentsToAcquirePropertyPlantAndEquipment").abs().rename("CapEx")
-        fcf_tag = _get_col("FreeCashFlow")
-        fcf = pd.Series(np.where(fcf_tag != 0, fcf_tag, cfo - capex), index=data.index, name="FCF")
-
-        op_inc = _get_col("OperatingIncomeLoss").rename("OperatingIncome")
-        sbc_arr = _get_col("SharebasedCompensationArrangementBySharebasedPaymentAwardCompensationCost1")
-        sbc_alloc = _get_col("AllocatedShareBasedCompensationExpense")
-        sbc_alt = np.where(sbc_arr != 0, sbc_arr, sbc_alloc)
-        sbc = _get_col("ShareBasedCompensation").where(lambda x: x != 0, sbc_alt)
-
-        restruct = _get_col("RestructuringCosts").where(
-            lambda x: x != 0, _get_col("RestructuringAndRelatedCostIncurredCost")
+        cfo = self._first_existing(
+            data,
+            [
+                "NetCashProvidedByUsedInOperatingActivities",
+                "OperatingCashFlow",
+                "CFO",
+            ],
         )
 
-        impairments = (
-            _get_col("GoodwillImpairmentLoss")
-            + _get_col("ImpairmentOfIntangibleAssetsExcludingGoodwill")
-            + _get_col("InventoryWriteDown")
+        if (
+            cfo is not None
+            and net_income is not None
+        ):
+
+            data["CFO_To_NetIncome"] = (
+                self._safe_divide(
+                    cfo,
+                    net_income,
+                )
+            )
+
+        capex = self._first_existing(
+            data,
+            [
+                "PaymentsToAcquirePropertyPlantAndEquipment",
+                "CapitalExpenditures",
+                "CapEx",
+            ],
         )
 
-        gains_losses = (
-            _get_col("GainLossOnSaleOfPropertyPlantEquipment")
-            + _get_col("GainLossOnSaleOfBusiness")
-            + _get_col("EquitySecuritiesFvNiGainLoss")
-        )
+        if cfo is not None and capex is not None:
 
-        norm_ebitda = pd.Series(
-            (op_inc + dna_final + sbc + restruct + impairments) - gains_losses,
-            index=data.index,
-            name="NormEBITDA"
-        )
-        ebitda = pd.Series(op_inc + dna_final, index=data.index, name="EBITDA")
+            # SEC data can represent capex as either positive or
+            # negative depending on source. Normalize it to positive
+            # expenditure before calculating ratios.
+            capex_abs = pd.to_numeric(
+                capex,
+                errors="coerce",
+            ).abs()
 
-        cogs = _get_col("CostOfGoodsAndServicesSold").where(
-            lambda x: x != 0, _get_col("CostOfRevenue")
-        )
-        gp_calc = _get_col("GrossProfit_Calculated").where(lambda x: x != 0, revenue - cogs)
-        gross_profit = pd.Series(_get_col("GrossProfit").where(lambda x: x != 0, gp_calc), index=data.index, name="GrossProfit")
+            data["CapEx_To_CFO"] = self._safe_divide(
+                capex_abs,
+                cfo.abs(),
+            )
 
-        shares_diluted = pd.Series(
-            _get_col("WeightedAverageNumberOfDilutedSharesOutstanding").where(
-                lambda x: x != 0,
-                _get_col("WeightedAverageNumberOfSharesOutstandingBasic")
-            ),
-            index=data.index,
-            name="SharesDiluted"
-        )
+            if revenue is not None:
 
-        total_debt = pd.Series(
-            _get_col("TotalDebt").where(
-                lambda x: x != 0,
-                _get_col("LongTermDebtCurrent") + _get_col("LongTermDebtNoncurrent")
-            ),
-            index=data.index,
-            name="TotalDebt"
-        )
-
-        working_cap = pd.Series(
-            _get_col("WorkingCapital").where(
-                lambda x: x != 0,
-                _get_col("AssetsCurrent") - _get_col("LiabilitiesCurrent")
-            ),
-            index=data.index,
-            name="WorkingCapital"
-        )
-
-        equity = _get_col("StockholdersEquity").rename("Equity")
-        eps_diluted = pd.Series(_get_col("EarningsPerShareDiluted"), index=data.index, name="EPS")
+                data["CapEx_To_Revenue"] = self._safe_divide(
+                    capex_abs,
+                    revenue,
+                )
 
         # -------------------------------------------------------------
-        # FEATURE COMPUTATION
+        # Actual ROIC
         # -------------------------------------------------------------
-        # 1. Growth Velocity
-        data["Revenue_QoQ_Growth"] = _pct_change(revenue, 1)
-        data["Revenue_YoY_Growth"] = _pct_change(revenue, 4)
-        data["EBITDA_YoY_Growth"] = _pct_change(norm_ebitda, 4)
-        data["EPS_YoY_Growth"] = _pct_change(eps_diluted, 4)
-        data["FCF_YoY_Growth"] = _pct_change(fcf, 4)
-        data["Operating_CashFlow_YoY_Growth"] = _pct_change(cfo, 4)
 
-        # 2. Fundamental Acceleration
-        data["Revenue_Acceleration"] = (
-            data.groupby("Ticker")["Revenue_YoY_Growth"].diff(1).clip(-1.0, 1.0)
+        data["Return_On_Invested_Capital"] = (
+            self.compute_roic(data)
         )
 
-        # 3. Margins & Deltas
-        data["Gross_Margin"] = _safe_divide(gross_profit, revenue)
-        data["Gross_Margin_YoY_Delta"] = _delta(data["Gross_Margin"].rename("Gross_Margin"), 4)
+        # -------------------------------------------------------------
+        # Effective tax rate
+        # -------------------------------------------------------------
 
-        data["EBITDA_Margin"] = _safe_divide(ebitda, revenue)
-        data["EBITDA_Margin_YoY_Delta"] = _delta(data["EBITDA_Margin"].rename("EBITDA_Margin"), 4)
-
-        data["FCF_Margin"] = _safe_divide(fcf, revenue)
-        data["FCF_Margin_YoY_Delta"] = _delta(data["FCF_Margin"].rename("FCF_Margin"), 4)
-
-        data["Operating_Margin"] = _safe_divide(op_inc, revenue)
-        data["Operating_Margin_QoQ_Delta"] = _delta(data["Operating_Margin"].rename("Operating_Margin"), 1)
-
-        # 4. Capital Structure & Reinvestment
-        data["Debt_YoY_Growth"] = _pct_change(total_debt, 4)
-        data["Shares_Outstanding_YoY_Change"] = _pct_change(shares_diluted, 4)
-        data["CapEx_YoY_Growth"] = _pct_change(capex, 4)
-
-        # 5. Financial Health Trajectory Signals
-        data["Return_On_Equity"] = _safe_divide(net_income, equity)
-        data["ROIC_YoY_Delta"] = _delta(data["Return_On_Equity"].rename("Return_On_Equity"), 4)
-        data["Working_Capital_YoY_Change"] = _pct_change(working_cap, 4)
-
-        # 6. Fundamental Volatility
-        data["Net_Margin"] = _safe_divide(net_income, revenue)
-
-        data["ROE_Volatility_8Q"] = data.groupby("Ticker")["Return_On_Equity"].transform(
-            lambda s: s.rolling(8, min_periods=4).std()
-        )
-        data["Margin_Volatility_8Q"] = data.groupby("Ticker")["Net_Margin"].transform(
-            lambda s: s.rolling(8, min_periods=4).std()
+        tax_expense = self._first_existing(
+            data,
+            [
+                "IncomeTaxExpenseBenefit",
+                "IncomeTaxExpense",
+            ],
         )
 
-        # Clean Extreme Infinite Values across all newly added numerical columns
-        new_cols = [
-            "Revenue_QoQ_Growth", "Revenue_YoY_Growth", "EBITDA_YoY_Growth", "EPS_YoY_Growth",
-            "FCF_YoY_Growth", "Operating_CashFlow_YoY_Growth", "Revenue_Acceleration",
-            "Gross_Margin", "Gross_Margin_YoY_Delta", "EBITDA_Margin", "EBITDA_Margin_YoY_Delta",
-            "FCF_Margin", "FCF_Margin_YoY_Delta", "Operating_Margin", "Operating_Margin_QoQ_Delta",
-            "Debt_YoY_Growth", "Shares_Outstanding_YoY_Change", "CapEx_YoY_Growth",
-            "Return_On_Equity", "ROIC_YoY_Delta", "Working_Capital_YoY_Change",
-            "Net_Margin", "ROE_Volatility_8Q", "Margin_Volatility_8Q"
+        pretax_income = self._first_existing(
+            data,
+            [
+                "IncomeBeforeTax",
+                "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+            ],
+        )
+
+        if (
+            tax_expense is not None
+            and pretax_income is not None
+        ):
+
+            data["Effective_Tax_Rate"] = (
+                self._safe_divide(
+                    tax_expense,
+                    pretax_income,
+                )
+                .clip(
+                    lower=-1.0,
+                    upper=1.0,
+                )
+            )
+
+        # -------------------------------------------------------------
+        # Goodwill / intangibles
+        # -------------------------------------------------------------
+
+        goodwill = self._first_existing(
+            data,
+            [
+                "Goodwill",
+                "GoodwillAndIntangibleAssets",
+            ],
+        )
+
+        intangibles = self._first_existing(
+            data,
+            [
+                "FiniteLivedIntangibleAssetsNet",
+                "IntangibleAssetsNetExcludingGoodwill",
+                "IntangibleAssets",
+            ],
+        )
+
+        if assets is not None:
+
+            if goodwill is not None:
+
+                data["Goodwill_To_Assets"] = (
+                    self._safe_divide(
+                        goodwill,
+                        assets,
+                    )
+                )
+
+            if (
+                goodwill is not None
+                and intangibles is not None
+            ):
+
+                data[
+                    "Intangibles_Plus_Goodwill_To_Assets"
+                ] = self._safe_divide(
+                    goodwill + intangibles,
+                    assets,
+                )
+
+        # -------------------------------------------------------------
+        # SBC
+        # -------------------------------------------------------------
+
+        sbc = self._first_existing(
+            data,
+            [
+                "ShareBasedCompensation",
+                "ShareBasedCompensationArrangementByShareBasedPaymentAwardEquityInstrumentsOtherThanOptionsGrantsInPeriodTotal",
+                "StockBasedCompensation",
+            ],
+        )
+
+        if (
+            sbc is not None
+            and revenue is not None
+        ):
+
+            data["SBC_To_Revenue"] = self._safe_divide(
+                sbc.abs(),
+                revenue,
+            )
+
+        # -------------------------------------------------------------
+        # R&D
+        # -------------------------------------------------------------
+
+        rnd = self._first_existing(
+            data,
+            [
+                "ResearchAndDevelopmentExpense",
+                "ResearchAndDevelopment",
+            ],
+        )
+
+        if rnd is not None and revenue is not None:
+
+            data["R_And_D_To_Revenue"] = self._safe_divide(
+                rnd.abs(),
+                revenue,
+            )
+
+        # -------------------------------------------------------------
+        # SGA
+        # -------------------------------------------------------------
+
+        sga = self._first_existing(
+            data,
+            [
+                "SellingGeneralAndAdministrativeExpense",
+                "SGA",
+            ],
+        )
+
+        if sga is not None and revenue is not None:
+
+            data["SGA_Intensity"] = self._safe_divide(
+                sga.abs(),
+                revenue,
+            )
+
+        # -------------------------------------------------------------
+        # Net debt / EBITDA
+        # -------------------------------------------------------------
+
+        if (
+            "_Net_Debt" in data.columns
+            and ebitda is not None
+        ):
+
+            data["Net_Debt_To_EBITDA"] = (
+                self._safe_divide(
+                    data["_Net_Debt"],
+                    ebitda,
+                )
+            )
+
+        # -------------------------------------------------------------
+        # Non-operating income reliance
+        # -------------------------------------------------------------
+
+        non_operating = self._first_existing(
+            data,
+            [
+                "NonOperatingIncome",
+                "OtherIncomeExpenseNet",
+                "OtherNonoperatingIncomeExpense",
+            ],
+        )
+
+        if (
+            non_operating is not None
+            and pretax_income is not None
+        ):
+
+            data["NonOperating_Income_Reliance"] = (
+                self._safe_divide(
+                    non_operating.abs(),
+                    pretax_income.abs(),
+                )
+            )
+
+        # -------------------------------------------------------------
+        # Reinvestment
+        # -------------------------------------------------------------
+
+        if (
+            capex is not None
+            and cfo is not None
+        ):
+
+            data["Reinvestment_Rate"] = (
+                self._safe_divide(
+                    capex.abs(),
+                    cfo.abs(),
+                )
+            )
+
+        # -------------------------------------------------------------
+        # Accrual ratio
+        # -------------------------------------------------------------
+
+        if (
+            net_income is not None
+            and cfo is not None
+            and assets is not None
+        ):
+
+            data["Accrual_Ratio"] = (
+                self._safe_divide(
+                    net_income - cfo,
+                    assets,
+                )
+            )
+
+
+        dividends = self._first_existing(
+            data,
+                [
+                    "PaymentsOfDividendsCommonStock",  # Primary US-GAAP common cash dividend
+                    "PaymentsOfDividends",            # Aggregate dividend payments
+                    "PaymentsOfDividendsPreferredStockAndPreferenceStock", # Preferred dividends fallback if analyzing equity cash outflows
+                ],
+        )
+
+        buybacks = self._first_existing(
+            data,
+            [
+                "PaymentsForRepurchaseOfCommonStock",
+                "PaymentsForRepurchaseOfWarrants",
+            ],
+        )
+
+        data["Payout_To_FCF"] = self._safe_divide(dividends + buybacks, fcf).clip(-5, 5)
+        data["Buyback_To_FCF"] = self._safe_divide(buybacks, fcf).clip(-5, 5)
+
+        retained_earnings = self._first_existing(
+            data,
+            ["RetainedEarningsAccumulatedDeficit"],
+        )
+        if retained_earnings is not None and assets is not None:
+            data["Retained_Earnings_To_Assets"] = self._safe_divide(
+                retained_earnings, assets
+            )
+
+        aoci = self._first_existing(
+            data,
+            ["AccumulatedOtherComprehensiveIncomeLossNetOfTax"],
+        )
+        if aoci is not None and equity is not None:
+            data["AOCI_To_Equity"] = self._safe_divide(
+                aoci, equity.abs()
+            )
+
+        lease_asset = self._first_existing(
+            data,
+            ["OperatingLeaseRightOfUseAsset"],
+        )
+        if lease_asset is not None and assets is not None:
+            data["Operating_Lease_To_Assets"] = self._safe_divide(
+                lease_asset, assets
+            )
+
+        deferred_tax = self._first_existing(
+            data,
+            ["DeferredIncomeTaxExpenseBenefit"],
+        )
+        if deferred_tax is not None and net_income is not None:
+            data["Deferred_Tax_To_NetIncome"] = self._safe_divide(
+                deferred_tax, net_income.abs()
+            )
+
+        # Cash tax rate and book-vs-cash tax gap.
+        cash_taxes = self._first_existing(
+            data,
+            ["IncomeTaxesPaidNet"],
+        )
+        if cash_taxes is not None and pretax_income is not None:
+            data["Cash_Tax_Rate"] = self._safe_divide(
+                cash_taxes.abs(), pretax_income.abs()
+            ).clip(-1.0, 1.0)
+
+        if "Cash_Tax_Rate" in data.columns and "Effective_Tax_Rate" in data.columns:
+            data["Cash_Vs_Book_Tax_Gap"] = (
+                data["Cash_Tax_Rate"] - data["Effective_Tax_Rate"]
+            )
+
+        goodwill_impairment = self._first_existing(
+            data,
+            ["GoodwillImpairmentLoss"],
+        )
+        if goodwill_impairment is not None:
+            data["Had_Goodwill_Impairment"] = (
+                pd.to_numeric(goodwill_impairment, errors="coerce")
+                .fillna(0)
+                .abs()
+                .gt(1e-12)
+                .astype(float)
+            )
+
+        # Working-capital efficiency. For quarterly income-statement flows,
+        # use ~91.25 days per quarter so the ratios remain comparable.
+        accounts_receivable = self._first_existing(
+            data, ["AccountsReceivableNetCurrent", "AccountsReceivableNet"]
+        )
+        inventory_wc = self._first_existing(
+            data, ["InventoryNet"]
+        )
+        accounts_payable = self._first_existing(
+            data, ["AccountsPayableCurrent"]
+        )
+        cogs = self._first_existing(
+            data,
+            ["CostOfGoodsAndServicesSold", "CostOfRevenue", "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization"],
+        )
+
+        if accounts_receivable is not None and revenue is not None:
+            data["DSO"] = self._safe_divide(
+                accounts_receivable, revenue
+            ) * 91.25
+
+        if inventory_wc is not None and cogs is not None:
+            data["DIO"] = self._safe_divide(
+                inventory_wc, cogs.abs()
+            ) * 91.25
+
+        if accounts_payable is not None and cogs is not None:
+            data["DPO"] = self._safe_divide(
+                accounts_payable, cogs.abs()
+            ) * 91.25
+
+        if {"DSO", "DIO", "DPO"}.issubset(data.columns):
+            data["Cash_Conversion_Cycle"] = (
+                data["DSO"] + data["DIO"] - data["DPO"]
+            )
+
+        # Revenue-quality growth diagnostics.
+        if accounts_receivable is not None and revenue is not None:
+            ar_growth = accounts_receivable.groupby(data[self.config.ticker_column]).transform(
+                lambda x: x.pct_change(4)
+            )
+            revenue_growth = revenue.groupby(data[self.config.ticker_column]).transform(
+                lambda x: x.pct_change(4)
+            )
+            data["AR_Growth_vs_Revenue_Growth"] = ar_growth - revenue_growth
+
+        if inventory_wc is not None and revenue is not None:
+            inv_growth = inventory_wc.groupby(data[self.config.ticker_column]).transform(
+                lambda x: x.pct_change(4)
+            )
+            revenue_growth = revenue.groupby(data[self.config.ticker_column]).transform(
+                lambda x: x.pct_change(4)
+            )
+            data["Inventory_Growth_vs_Revenue_Growth"] = inv_growth - revenue_growth
+
+        deferred_revenue = self._first_existing(
+            data, ["DeferredRevenueCurrent", "DeferredRevenueNoncurrent"]
+        )
+        if deferred_revenue is not None and revenue is not None:
+            # Use both current and non-current deferred revenue where both
+            # exist. If only one exists, _first_existing supplies it.
+            if "DeferredRevenueCurrent" in data.columns and "DeferredRevenueNoncurrent" in data.columns:
+                deferred_revenue = (
+                    pd.to_numeric(data["DeferredRevenueCurrent"], errors="coerce").fillna(0)
+                    + pd.to_numeric(data["DeferredRevenueNoncurrent"], errors="coerce").fillna(0)
+                )
+            data["Deferred_Revenue_To_Revenue"] = self._safe_divide(
+                deferred_revenue, revenue
+            )
+            data["Deferred_Revenue_YoY_Growth"] = deferred_revenue.groupby(
+                data[self.config.ticker_column]
+            ).transform(lambda x: x.pct_change(4))
+
+            billings_proxy = revenue + deferred_revenue.groupby(
+                data[self.config.ticker_column]
+            ).diff(1)
+            data["Billings_Proxy_YoY"] = billings_proxy.groupby(
+                data[self.config.ticker_column]
+            ).transform(lambda x: x.pct_change(4))
+
+        acquisitions = self._first_existing(
+            data, ["PaymentsToAcquireBusinessesNetOfCashAcquired"]
+        )
+        if acquisitions is not None and revenue is not None:
+            data["Acquisition_Intensity"] = self._safe_divide(
+                acquisitions.abs(), revenue
+            )
+
+        debt_issued = self._first_existing(
+            data, ["ProceedsFromIssuanceOfLongTermDebt"]
+        )
+        debt_repaid = self._first_existing(
+            data, ["RepaymentsOfLongTermDebt"]
+        )
+        if debt_issued is not None or debt_repaid is not None:
+            issued = (
+                pd.to_numeric(debt_issued, errors="coerce")
+                if debt_issued is not None
+                else pd.Series(0.0, index=data.index)
+            )
+            repaid = (
+                pd.to_numeric(debt_repaid, errors="coerce")
+                if debt_repaid is not None
+                else pd.Series(0.0, index=data.index)
+            )
+            if assets is not None:
+                data["Net_Debt_Issuance_To_Assets"] = self._safe_divide(
+                    issued.fillna(0) - repaid.abs().fillna(0), assets.abs()
+                )
+
+        # -------------------------------------------------------------
+        # Clean extreme fundamental ratios
+        # -------------------------------------------------------------
+
+        ratio_columns = [
+            c
+            for c in self.snapshot_columns
+            if c in data.columns
         ]
 
-        data[new_cols] = data[new_cols].replace([np.inf, -np.inf], np.nan)
+        for column in ratio_columns:
+
+            data[column] = (
+                pd.to_numeric(
+                    data[column],
+                    errors="coerce",
+                )
+            )
+
+            data[column] = (
+                data[column]
+                .replace(
+                    [np.inf, -np.inf],
+                    np.nan,
+                )
+            )
+
+            data[column] = (
+                self._winsorize_series(
+                    data[column]
+                )
+            )
+
+        return data
+
+    # =================================================================
+    # Fundamental trends
+    # =================================================================
+
+    def compute_financial_trends(
+        self,
+        data: pd.DataFrame,
+    ) -> pd.DataFrame:
+
+        data = data.copy()
+
+        if self.config.ticker_column in data.columns:
+
+            data = data.sort_values(
+                [
+                    self.config.ticker_column,
+                    self.config.date_column,
+                ]
+            )
+
+        grouped = data.groupby(
+            self.config.ticker_column,
+            group_keys=False,
+        )
+
+        # -------------------------------------------------------------
+        # Helper
+        # -------------------------------------------------------------
+
+        def add_yoy(
+            output_name: str,
+            source_candidates: list[str],
+        ):
+
+            source = self._first_existing(
+                data,
+                source_candidates,
+            )
+
+            if source is not None:
+
+                data[output_name] = grouped[
+                    source.name
+                ].transform(
+                    lambda x: x.pct_change(4)
+                )
+
+        def add_qoq(
+            output_name: str,
+            source_candidates: list[str],
+        ):
+
+            source = self._first_existing(
+                data,
+                source_candidates,
+            )
+
+            if source is not None:
+
+                data[output_name] = grouped[
+                    source.name
+                ].transform(
+                    lambda x: x.pct_change(1)
+                )
+
+        # -------------------------------------------------------------
+        # Growth
+        # -------------------------------------------------------------
+
+        add_yoy(
+            "Revenue_YoY_Growth",
+            [
+                "Revenue",
+                "Revenues",
+                "RevenueFromContractWithCustomerExcludingAssessedTax",
+                "RevenueFromContractWithCustomerIncludingAssessedTax",
+                "SalesRevenueNet",
+                "TotalRevenue_Consolidated",
+            ],
+        )
+
+        add_qoq(
+            "Revenue_QoQ_Growth",
+            [
+                "Revenue",
+                "Revenues",
+                "RevenueFromContractWithCustomerExcludingAssessedTax",
+                "RevenueFromContractWithCustomerIncludingAssessedTax",
+                "SalesRevenueNet",
+                "TotalRevenue_Consolidated",
+            ],
+        )
+
+        add_yoy(
+            "NetIncome_YoY_Growth",
+            [
+                "NetIncome",
+                "NetIncomeLoss",
+            ],
+        )
+
+        add_yoy(
+            "EPS_YoY_Growth",
+            [
+                "EPS",
+                "DilutedEPS",
+                "EarningsPerShareDiluted",
+            ],
+        )
+
+        add_yoy(
+            "EBITDA_YoY_Growth",
+            [
+                "EBITDA",
+                "EBITDA_Calculated",
+            ],
+        )
+
+        add_yoy(
+            "FCF_YoY_Growth",
+            [
+                "FreeCashFlow",
+                "FCF",
+            ],
+        )
+
+        add_yoy(
+            "Operating_CashFlow_YoY_Growth",
+            [
+                "NetCashProvidedByUsedInOperatingActivities",
+                "OperatingCashFlow",
+                "CFO",
+            ],
+        )
+
+        # -------------------------------------------------------------
+        # Revenue acceleration
+        # -------------------------------------------------------------
+
+        if "Revenue_YoY_Growth" in data.columns:
+
+            data["Revenue_Acceleration"] = grouped[
+                "Revenue_YoY_Growth"
+            ].transform(
+                lambda x: x.diff()
+            )
+
+        # -------------------------------------------------------------
+        # Margin trends
+        # -------------------------------------------------------------
+
+        for source, output in [
+            (
+                "Gross_Margin",
+                "Gross_Margin_YoY_Delta",
+            ),
+            (
+                "EBITDA_Margin",
+                "EBITDA_Margin_YoY_Delta",
+            ),
+            (
+                "FCF_Margin",
+                "FCF_Margin_YoY_Delta",
+            ),
+        ]:
+
+            if source in data.columns:
+
+                data[output] = grouped[
+                    source
+                ].transform(
+                    lambda x: x.diff(4)
+                )
+
+        if "Operating_Margin" in data.columns:
+
+            data["Operating_Margin_QoQ_Delta"] = grouped[
+                "Operating_Margin"
+            ].transform(
+                lambda x: x.diff(1)
+            )
+
+        # -------------------------------------------------------------
+        # ROA / ROE trend
+        # -------------------------------------------------------------
+
+        for source, output in [
+            (
+                "Return_On_Assets",
+                "ROA_YoY_Delta",
+            ),
+            (
+                "Return_On_Equity",
+                "ROE_YoY_Delta",
+            ),
+        ]:
+
+            if source in data.columns:
+
+                data[output] = grouped[
+                    source
+                ].transform(
+                    lambda x: x.diff(4)
+                )
+
+        # -------------------------------------------------------------
+        # ACTUAL ROIC trend
+        # -------------------------------------------------------------
+
+        if "Return_On_Invested_Capital" in data.columns:
+
+            data["ROIC_YoY_Delta"] = grouped[
+                "Return_On_Invested_Capital"
+            ].transform(
+                lambda x: x.diff(4)
+            )
+
+        # -------------------------------------------------------------
+        # Debt
+        # -------------------------------------------------------------
+
+        if "TotalDebt" in data.columns:
+
+            data["Debt_YoY_Growth"] = grouped[
+                "TotalDebt"
+            ].transform(
+                lambda x: x.pct_change(4)
+            )
+
+        # -------------------------------------------------------------
+        # Working capital
+        # -------------------------------------------------------------
+
+        if "_Working_Capital" in data.columns:
+
+            data["Working_Capital_YoY_Change"] = grouped[
+                "_Working_Capital"
+            ].transform(
+                lambda x: x.diff(4)
+            )
+
+        # -------------------------------------------------------------
+        # Shares outstanding
+        # -------------------------------------------------------------
+
+        shares = self._first_existing(
+            data,
+            [
+                "CommonStockSharesOutstanding",
+                "EntityCommonStockSharesOutstanding",
+                "WeightedAverageNumberOfSharesOutstandingBasic",
+                "WeightedAverageNumberOfDilutedSharesOutstanding",
+            ],
+        )
+
+        if shares is not None:
+
+            data["Shares_Outstanding_YoY_Change"] = grouped[
+                shares.name
+            ].transform(
+                lambda x: x.pct_change(4)
+            )
+
+        # -------------------------------------------------------------
+        # CapEx growth
+        # -------------------------------------------------------------
+
+        capex = self._first_existing(
+            data,
+            [
+                "PaymentsToAcquirePropertyPlantAndEquipment",
+                "CapitalExpenditures",
+                "CapEx",
+            ],
+        )
+
+        if capex is not None:
+
+            data["CapEx_YoY_Growth"] = grouped[
+                capex.name
+            ].transform(
+                lambda x: x.abs().pct_change(4)
+            )
+
+        # -------------------------------------------------------------
+        # Volatility
+        # -------------------------------------------------------------
+
+        if "Return_On_Equity" in data.columns:
+
+            data["ROE_Volatility_8Q"] = grouped[
+                "Return_On_Equity"
+            ].transform(
+                lambda x: x.rolling(
+                    8,
+                    min_periods=4,
+                ).std()
+            )
+
+        if "Operating_Margin" in data.columns:
+
+            data["Margin_Volatility_8Q"] = grouped[
+                "Operating_Margin"
+            ].transform(
+                lambda x: x.rolling(
+                    8,
+                    min_periods=4,
+                ).std()
+            )
+
+        dividends = self._first_existing(
+            data,
+                [
+                    "PaymentsOfDividendsCommonStock",  # Primary US-GAAP common cash dividend
+                    "PaymentsOfDividends",            # Aggregate dividend payments
+                    "PaymentsOfDividendsPreferredStockAndPreferenceStock", # Preferred dividends fallback if analyzing equity cash outflows
+                ],
+        )
+
+        dps = self._first_existing(
+            data,
+            [
+                "CommonStockDividendsPerShareDeclared",
+                "CommonStockDividendsPerShareCashPaid",
+            ]
+        )
+
+        if dps is None or dps.isna().all():
+            dps = (dividends.abs() / shares)
+
+        # Calculate 4-Quarter (YoY) Growth grouped by Ticker
+        data["Dividend_Per_Share_YoY_Growth"] = data.groupby("Ticker")[dps.name if hasattr(dps, 'name') else "DPS"].transform(
+            lambda s: s.pct_change(periods=4)
+        ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+        # -------------------------------------------------------------
+        # Normalize extreme values
+        # -------------------------------------------------------------
+
+        for column in self.trend_columns:
+
+            if column not in data.columns:
+                continue
+
+            data[column] = pd.to_numeric(
+                data[column],
+                errors="coerce",
+            )
+
+            data[column] = data[column].replace(
+                [np.inf, -np.inf],
+                np.nan,
+            )
+
+            data[column] = (
+                data[column]
+                .clip(
+                    lower=-10,
+                    upper=10,
+                )
+            )
+
+        return data
+
+    # =================================================================
+    # Sector Z-score
+    # =================================================================
+
+    def add_sector_zscores(
+        self,
+        data: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Add sector-relative versions of selected features.
+
+        Requires:
+            Sector
+
+        If Sector is not available, this method simply returns data.
+
+        The normalization is cross-sectional by Date + Sector.
+        """
+
+        data = data.copy()
+
+        if "Sector" not in data.columns:
+            return data
+
+        if self.config.date_column not in data.columns:
+            return data
+
+        for column in self.sector_base_columns:
+
+            if column not in data.columns:
+                continue
+
+            output = f"{column}_SectorZ"
+
+            grouped = data.groupby(
+                [
+                    self.config.date_column,
+                    "Sector",
+                ],
+                observed=True,
+            )[column]
+
+            mean = grouped.transform("mean")
+            std = grouped.transform("std")
+
+            data[output] = (
+                (data[column] - mean)
+                /
+                std.replace(0, np.nan)
+            )
+
+            data[output] = data[output].clip(
+                -5,
+                5,
+            )
+
+        return data
+
+    # =================================================================
+    # Market features
+    # =================================================================
+
+    def compute_market_features(
+        self,
+        data: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Compute price-derived market features.
+
+        These are intentionally retained in the combined model because
+        the latest AinyFin experiment shows that market-state variables
+        may add predictive information.
+
+        Critical:
+            These features must be computed strictly from prices
+            available on or before the observation date.
+        """
+
+        data = data.copy()
+
+        if "Close" not in data.columns:
+            return data
+
+        if self.config.ticker_column not in data.columns:
+            return data
+
+        data = data.sort_values([self.config.ticker_column,"Date",])
+
+        grouped = data.groupby(
+            self.config.ticker_column,
+            group_keys=False,
+        )
+
+        close = pd.to_numeric(data["Close"],  errors="coerce")
+
+        # -------------------------------------------------------------
+        # Momentum 1M
+        # -------------------------------------------------------------
+
+        data["Momentum_1M"] = grouped["Close"].transform(lambda x: x.pct_change(21))
+
+        # -------------------------------------------------------------
+        # Momentum 3M
+        # -------------------------------------------------------------
+
+        data["Momentum_3M"] = grouped["Close"].transform(lambda x: x.pct_change(63))
+
+        # -------------------------------------------------------------
+        # Momentum 12M minus 1M
+        # -------------------------------------------------------------
+
+        momentum_12m = grouped["Close"].transform(lambda x: x.pct_change(252))
+
+        momentum_1m = data["Momentum_1M"]
+
+        data["Momentum_12M_1M"] = (momentum_12m - momentum_1m)
+
+        # -------------------------------------------------------------
+        # 52-week high
+        # -------------------------------------------------------------
+
+        rolling_high = grouped["Close"].transform(
+            lambda x: x.rolling(
+                252,
+                min_periods=20,
+            ).max()
+        )
+
+        data["Price_Vs_52W_High"] = (close / rolling_high)
+
+        # -------------------------------------------------------------
+        # Realized volatility
+        # -------------------------------------------------------------
+
+        daily_return = grouped[
+            "Close"
+        ].transform(
+            lambda x: x.pct_change()
+        )
+
+        data["Realized_Vol_60D"] = grouped[
+            "Close"
+        ].transform(
+            lambda x: x.pct_change()
+            .rolling(
+                60,
+                min_periods=20,
+            )
+            .std()
+            * np.sqrt(252)
+        )
+
+        # -------------------------------------------------------------
+        # Daily range
+        # -------------------------------------------------------------
+
+        if (
+            "High" in data.columns
+            and "Low" in data.columns
+        ):
+            data["Daily_Range_Pct"] = (
+                (
+                    pd.to_numeric(
+                        data["High"],
+                        errors="coerce",
+                    )
+                    -
+                    pd.to_numeric(
+                        data["Low"],
+                        errors="coerce",
+                    )
+                )
+                /
+                close
+            )
+
+        # -------------------------------------------------------------
+        # Volume features
+        # -------------------------------------------------------------
+
+        if "Volume" in data.columns:
+            volume = pd.to_numeric(
+                data["Volume"],
+                errors="coerce",
+            )
+
+            avg_volume = grouped[
+                "Volume"
+            ].transform(
+                lambda x: x.rolling(
+                    60,
+                    min_periods=20,
+                ).mean()
+            )
+
+            data["Volume_Vs_60D_Avg"] = (
+                volume / avg_volume
+            )
+
+            data["Dollar_Volume_Log"] = np.log1p(
+                volume * close
+            )
+
+        return data
+
+    # =================================================================
+    # Build feature dataframe
+    # =================================================================
+
+    def _prepare_financial_data(
+        self,
+        financial_data: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Build quarterly fundamental features from financial_data.csv.
+
+        financial_data.csv is the authoritative source for SEC fundamentals.
+        Trends MUST be calculated while the data is still quarterly. Doing
+        them after merging to daily prices would create false daily changes.
+        """
+        data = financial_data.copy()
+
+        required = [
+            self.config.ticker_column,
+            self.config.date_column,
+        ]
+        missing = [c for c in required if c not in data.columns]
+        if missing:
+            raise ValueError(
+                "financial_data.csv is missing required columns: "
+                f"{missing}"
+            )
+
+        data[self.config.ticker_column] = (
+            data[self.config.ticker_column]
+            .astype(str)
+            .str.upper()
+            .str.strip()
+        )
+        data[self.config.date_column] = pd.to_datetime(
+            data[self.config.date_column],
+            errors="coerce",
+        )
+        data = data.dropna(
+            subset=[
+                self.config.ticker_column,
+                self.config.date_column,
+            ]
+        )
+
+        data = data.sort_values(
+            [
+                self.config.ticker_column,
+                self.config.date_column,
+            ]
+        ).reset_index(drop=True)
+
+        # Fundamental snapshot and trends are calculated BEFORE the
+        # quarterly data is merged into daily prices.
+        data = self.compute_financial_snapshot(data)
+        data = self.compute_financial_trends(data)
+        data["Date"] = pd.to_datetime(data["Date"])
+        data = data.sort_values(["Date"]).reset_index(drop=True)
+        return data
+
+
+    def build_features(
+        self,
+        data: pd.DataFrame,
+        financial_data: Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
+        """
+        Assemble the final daily modeling dataset.
+
+        Sources:
+            1. ainyfin_data.csv
+               Daily prices + target (bhsScore).
+            2. financial_data.csv
+               Quarterly SEC fundamentals.
+
+        Fundamental trends are calculated on the quarterly financial data
+        first, then point-in-time merged into daily observations.
+        """
+        price_data = data.copy()
+
+        # -------------------------------------------------------------
+        # Daily price/target data
+        # -------------------------------------------------------------
+        price_data[self.config.ticker_column] = (
+            price_data[self.config.ticker_column]
+            .astype(str)
+            .str.upper()
+            .str.strip()
+        )
+        price_data[self.config.date_column] = pd.to_datetime(
+            price_data[self.config.date_column],
+            errors="coerce",
+        )
+
+        price_data = price_data.dropna(
+            subset=[
+                self.config.ticker_column,
+                self.config.date_column,
+            ]
+        )
+
+        price_data = price_data.sort_values(
+            [
+                self.config.ticker_column,
+                self.config.date_column,
+            ]
+        ).reset_index(drop=True)
+
+        if financial_data is None:
+            raise ValueError(
+                "financial_data must be supplied. "
+                "The model now uses financial_data.csv as the authoritative "
+                "source for fundamental features."
+            )
+
+        # -------------------------------------------------------------
+        # SEC fundamentals
+        # -------------------------------------------------------------
+        fundamentals = self._prepare_financial_data(
+            financial_data
+        )
+
+        # -------------------------------------------------------------
+        # Point-in-time merge
+        # -------------------------------------------------------------
+        #
+        # For each daily price observation, use the most recent financial
+        # filing that was available on or before that date.
+        #
+        # This is deliberately NOT a simple merge on quarter-end Date.
+        # -------------------------------------------------------------
+        left = price_data.sort_values([self.config.date_column])
+        right = fundamentals.sort_values([self.config.date_column])
+
+        data = pd.merge_asof(
+            left,
+            right,
+            by=self.config.ticker_column,
+            left_on="Date",
+            right_on="Date",
+            direction="backward",
+            allow_exact_matches=True,
+        )
+        #print("Merged data:\n", data)
+
+        # -------------------------------------------------------------
+        # Market features
+        # -------------------------------------------------------------
+        data = self.compute_market_features(data)
+        data.to_csv(f"{AinySchema.DATA_DIR}/merged_data_with_market_features.csv", index=False)
+        #print("compute_market_features data:\n", data)
+
+        # -------------------------------------------------------------
+        # Price-dependent valuation features
+        # -------------------------------------------------------------
+        data = self.compute_valuation_features(data)
+        print("compute_valuation_features data:\n", data)
+
+        # -------------------------------------------------------------
+        # Sector-relative features
+        # -------------------------------------------------------------
+        data = self.add_sector_zscores(data)
+        print("add_sector_zscores data:\n", data)
 
         return data
 
 
-    def transformFeatureXY(self, X: pd.DataFrame, org: str) -> pd.DataFrame:
-        df_transformed = X.T
-        # 1. Convert date headers from the index into a dedicated 'Date' column
-        df_transformed = df_transformed.reset_index().rename(columns={'index': 'Date'})
-        # 2. Ensure Date is datetime type
-        df_transformed['Date'] = pd.to_datetime(df_transformed['Date'])
-        df_transformed['Ticker'] = org
-        return df_transformed
 
+    def calculate_ebitda(self, df: pd.DataFrame) -> pd.Series:
 
-    def load_test_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-        feature_df = self.load_train_data()[self.training_columns]
-        # print(self.target_column,":", feature_df[self.target_column])
-        # print("feature_df:", df.shape, feature_df.columns)
-
-        # 7. Separate features and target
-        X = feature_df.drop(columns=[self.target_column])
-        y = feature_df[self.target_column] - 1  # Shift 1-5 rating to 0-4 for XGBoost
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.3, random_state=42, stratify=y
+        # 1. Depreciation & Amortization
+        dna = self._first_existing(
+            df,
+            [
+                "DepreciationDepletionAndAmortization",
+                "DepreciationAndAmortization",
+                "DepreciationAmortizationAndAccretionNet",
+                "Depreciation",
+            ],
         )
-        return X_test, y_test
 
+        if dna is None:
+            dna = pd.Series(0.0, index=df.index)
+        else:
+            dna = pd.to_numeric(dna, errors="coerce").fillna(0.0)
 
-    def train(self, feature_df):
-        df = feature_df[self.training_columns]
+        # 2. Operating Income
+        operating_income = self._first_existing(
+            df,
+            [
+                "OperatingIncomeLoss",
+                "OperatingIncome",
+                "Operating_Income",
+            ],
+        )
 
-        # 1. Separate features and target
-        X = df.drop(columns=[self.target_column])
-        y = df[self.target_column] - 1  # Shift 1-3 rating to 0-3 for XGBoost
-
-        n_splits: int = 5
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-
-        oof_predictions = np.zeros(len(df))
-        cv_accuracies = []
-        cv_f1_scores = []
-
-        print(f"\n=== Starting {n_splits}-Fold Stratified Cross-Validation ===")
-        print("final_df y_train:", feature_df[self.target_column].unique())
-
-        # 3. Iterate through folds
-        for fold, (train_idx, val_idx) in enumerate(skf.split(X, y), start=1):
-            X_train_fold, X_val_fold = X.iloc[train_idx], X.iloc[val_idx]
-            y_train_fold, y_val_fold = y.iloc[train_idx], y.iloc[val_idx]
-
-            # 9. Initialize Gradient Boosting Classifier
-            # Multi-class uses 'multinomial' deviance loss automatically
-            """
-            fold_model = XGBClassifier(
-                n_estimators=self.n_estimators,
-                        learning_rate=0.05,
-                        max_depth=5,
-                        objective="multi:softprob",
-                        eval_metric="mlogloss",
-                        random_state=42,
-            )
-            """
-
-            fold_model = XGBClassifier(
-                    n_estimators=50,
-                    max_depth=3,  # Reduce depth from 5 to 3
-                    learning_rate=0.03,
-                    subsample=0.8,  # Randomly sample 80% of rows per tree
-                    colsample_bytree=0.8,  # Randomly sample 80% of features per tree
-                    reg_alpha=1.0,  # L1 regularization
-                    reg_lambda=1.0,  # L2 regularization
+        if operating_income is not None:
+            operating_income = pd.to_numeric(
+                operating_income,
+                errors="coerce"
             )
 
-            # 10. Train the model
-            fold_model.fit(X_train_fold, y_train_fold)
-            print("fold_model classes:", fold_model.n_classes_, fold_model.classes_)
+            ebitda_top_down = operating_income + dna
+        else:
+            ebitda_top_down = pd.Series(np.nan, index=df.index)
 
-            # Predict on validation fold
-            val_preds = fold_model.predict(X_val_fold)
-            oof_predictions[val_idx] = val_preds
+        # 3. Bottom-up fallback
+        net_income = self._first_existing(
+            df,
+            [
+                "NetIncomeLoss",
+                "ProfitLoss",
+            ],
+        )
 
-            # Metric evaluation
-            fold_acc = accuracy_score(y_val_fold, val_preds)
-            fold_f1 = f1_score(y_val_fold, val_preds, average="weighted")
+        if net_income is not None:
 
-            cv_accuracies.append(fold_acc)
-            cv_f1_scores.append(fold_f1)
+            net_income = pd.to_numeric(
+                net_income,
+                errors="coerce"
+            )
+
+            interest_expense = self._first_existing(
+                df,
+                [
+                    "InterestExpense",
+                    "InterestExpenseNonoperating",
+                ],
+            )
+
+            if interest_expense is None:
+                interest_expense = pd.Series(0.0, index=df.index)
+            else:
+                interest_expense = pd.to_numeric(
+                    interest_expense,
+                    errors="coerce"
+                ).fillna(0.0)
+
+            tax = self._first_existing(
+                df,
+                [
+                    "IncomeTaxExpenseBenefit",
+                    "CurrentIncomeTaxExpenseBenefit",
+                ],
+            )
+
+            if tax is None:
+                tax = pd.Series(0.0, index=df.index)
+            else:
+                tax = pd.to_numeric(
+                    tax,
+                    errors="coerce"
+                ).fillna(0.0)
+
+            ebitda_bottom_up = (
+                net_income
+                + interest_expense
+                + tax
+                + dna
+            )
+
+        else:
+            ebitda_bottom_up = pd.Series(
+                np.nan,
+                index=df.index
+            )
+
+        return ebitda_top_down.fillna(ebitda_bottom_up)
+
+
+    # =================================================================
+    # Price-dependent valuation features
+    # =================================================================
+    def compute_valuation_features(
+        self,
+        data: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Compute valuation ratios only after daily Close has been merged
+        with the point-in-time financial fundamentals.
+
+        Missing denominator data remains NaN rather than being converted
+        to zero.
+        """
+        data = data.copy()
+
+        close = self._first_existing(
+            data,
+            ["Close"],
+        )
+
+        revenue = self._first_existing(
+            data,
+            [
+                "RevenueFromContractWithCustomerExcludingAssessedTax",  # Primary ASC 606 GAAP tag
+                "Revenues",                                             # Aggregate GAAP tag
+                "SalesRevenueNet",                                      # Standard product/service sales tag
+                "TotalRevenue_Consolidated",                            # Consolidated dataset tag
+                "RevenueFromContractWithCustomerIncludingAssessedTax", # Alternative ASC 606 tag
+            ],
+        )
+
+        net_income = self._first_existing(
+            data,
+            ["NetIncome", "NetIncomeLoss"],
+        )
+
+        fcf = self._first_existing(
+            data,
+            ["FreeCashFlow", "FCF"],
+        )
+
+        equity = self._first_existing(
+            data,
+            [
+                "StockholdersEquity",
+                "Stockholders_Equity",
+                "StockholdersEquityAbstract",
+                "TotalEquity",
+                "Equity",
+            ],
+        )
+
+        assets = self._first_existing(
+            data,
+            ["Assets", "TotalAssets"],
+        )
+
+        ebitda = self.calculate_ebitda(data)
+
+        operating_income = self._first_existing(
+            data,
+            [
+                "OperatingIncome",
+                "Operating_Income",
+                "OperatingIncomeLoss",
+            ],
+        )
+
+        shares = self._first_existing(
+            data,
+            [
+                "CommonStockSharesOutstanding",
+                "EntityCommonStockSharesOutstanding",
+                "WeightedAverageNumberOfSharesOutstandingBasic",
+                "WeightedAverageNumberOfDilutedSharesOutstanding",
+            ],
+        )
+
+        debt = self._first_existing(data, ["TotalDebt", "Debt"])
+
+        cash = self._first_existing(
+            data,
+            [
+                "CashAndCashEquivalents",
+                "CashAndCashEquivalentsAtCarryingValue",
+                "CashCashEquivalentsAndShortTermInvestments",
+                "Cash",
+                "CashAndShortTermInvestments",
+            ],
+        )
+
+        if close is None:
+            return data
+
+        close = pd.to_numeric(close, errors="coerce")
+
+        # Market capitalization is needed for P/E, P/B, and P/S.
+        if shares is not None:
+            market_cap = close * pd.to_numeric(
+                shares,
+                errors="coerce",
+            )
+            data["_Market_Cap"] = market_cap
+        else:
+            market_cap = None
+
+        if market_cap is not None:
+            if net_income is not None:
+                data["Price_To_Earnings"] = self._safe_divide(
+                    market_cap,
+                    net_income,
+                )
+
+            if equity is not None:
+                data["Price_To_Book"] = self._safe_divide(
+                    market_cap,
+                    equity,
+                )
+
+            if revenue is not None:
+                data["Price_To_Sales"] = self._safe_divide(
+                    market_cap,
+                    revenue,
+                )
+
+            if fcf is not None:
+                data["Price_To_FreeCashFlow"] = self._safe_divide(
+                    market_cap,
+                    fcf,
+                )
+
+        print("market_cap:\n", market_cap)
+        print("operating_income:\n", operating_income)
+        print("net_income:\n", net_income)
+        print("ebitda:\n", ebitda)
+        print("debt:\n",debt)
+        print("revenue:\n",revenue)
+
+        if market_cap is not None and ebitda is not None:
+            if debt is not None:
+                net_debt = (
+                    pd.to_numeric(debt, errors="coerce")
+                    - (
+                        pd.to_numeric(cash, errors="coerce")
+                        if cash is not None
+                        else 0.0
+                    )
+                )
+                enterprise_value = market_cap + net_debt
+                data["EV_To_EBITDA"] = self._safe_divide(
+                    enterprise_value,
+                    ebitda,
+                )
+
+        if market_cap is not None and operating_income is not None:
+            if debt is not None:
+                net_debt = (
+                    pd.to_numeric(debt, errors="coerce")
+                    - (
+                        pd.to_numeric(cash, errors="coerce")
+                        if cash is not None
+                        else 0.0
+                    )
+                )
+                enterprise_value = market_cap + net_debt
+                data["EV_To_EBIT"] = self._safe_divide(
+                    enterprise_value,
+                    operating_income,
+                )
+
+        buybacks = self._first_existing(
+            data,
+            [
+                "PaymentsForRepurchaseOfCommonStock",
+                "PaymentsForRepurchaseOfWarrants",
+            ],
+        )
+
+        if buybacks is None:
+            buybacks = pd.Series(0.0, index=data.index)
+        else:
+            buybacks = pd.to_numeric(buybacks, errors="coerce").fillna(0.0)
+
+        if market_cap is None:
+            market_cap = pd.Series(0.0, index=data.index)
+        else:
+            market_cap = pd.to_numeric(market_cap, errors="coerce").fillna(0.0)
+
+        data["Buyback_Yield"] = buybacks.abs() / market_cap.abs()
+
+        dividends = self._first_existing(
+            data,
+                [
+                    "PaymentsOfDividendsCommonStock",  # Primary US-GAAP common cash dividend
+                    "PaymentsOfDividends",            # Aggregate dividend payments
+                    "PaymentsOfDividendsPreferredStockAndPreferenceStock", # Preferred dividends fallback if analyzing equity cash outflows
+                ],
+        )
+
+        if dividends is None:
+            dividends = pd.Series(0.0, index=data.index)
+        else:
+            dividends = pd.to_numeric(dividends, errors="coerce").fillna(0.0)
+
+        # Take absolute value as cash flow items are sometimes reported as negative numbers
+        data["Dividend_Yield"] = dividends.abs() / market_cap.abs()
+        return data
+
+    # =================================================================
+    # Source-column audit
+    # =================================================================
+
+    def audit_source_columns(
+        self,
+        financial_data: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Report which source columns required by ModelBuilder are available.
+
+        This is based on the actual financial_data.csv schema supplied for
+        AinyFin. It helps catch schema drift before a training run.
+        """
+        checks = {
+            "Revenue": [
+                "RevenueFromContractWithCustomerExcludingAssessedTax",
+                "Revenues",
+                "RevenueFromContractWithCustomerIncludingAssessedTax",
+                "SalesRevenueNet",
+            ],
+            "NetIncome": ["NetIncomeLoss", "ProfitLoss"],
+            "OperatingIncome": ["OperatingIncomeLoss"],
+            "EBITDA": [
+                "EBITDA",
+                "OperatingIncomeLoss + DepreciationAndAmortization",
+            ],
+            "FreeCashFlow": ["FreeCashFlow"],
+            "Cash": [
+                "CashAndCashEquivalentsAtCarryingValue",
+                "CashCashEquivalentsAndShortTermInvestments",
+            ],
+            "Equity": ["StockholdersEquity", "StockholdersEquityAbstract"],
+            "Debt": ["TotalDebt", "LongTermDebt", "LongTermDebtNoncurrent"],
+            "Shares": [
+                "CommonStockSharesOutstanding",
+                "WeightedAverageNumberOfSharesOutstandingBasic",
+                "WeightedAverageNumberOfDilutedSharesOutstanding",
+            ],
+            "CapEx": ["PaymentsToAcquirePropertyPlantAndEquipment"],
+            "SBC": ["ShareBasedCompensation", "AllocatedShareBasedCompensationExpense"],
+            "R&D": ["ResearchAndDevelopmentExpense"],
+            "SG&A": ["SellingGeneralAndAdministrativeExpense"],
+            "Goodwill": ["Goodwill"],
+            "Intangibles": ["IntangibleAssetsNetExcludingGoodwill"],
+            "Sector": ["SIC"],
+            "FilingDate": [
+                "FilingDate", "filing_date", "FiledDate", "acceptedDate",
+                "AcceptedDate", "SEC_Filing_Date", "Date",
+            ],
+        }
+
+        rows = []
+        columns = set(financial_data.columns)
+        for logical_name, candidates in checks.items():
+            found = [c for c in candidates if c in columns]
+            rows.append({
+                "Logical_Field": logical_name,
+                "Available": bool(found) or logical_name == "EBITDA",
+                "Matched_Columns": "; ".join(found),
+            })
+
+        return pd.DataFrame(rows)
+
+    # =================================================================
+    # Expand model feature schema
+    # =================================================================
+
+    def get_available_training_columns(
+        self,
+        data: pd.DataFrame,
+    ) -> list[str]:
+
+        available = [
+            column
+            for column in self.available_training_columns
+            if column in data.columns
+        ]
+
+        return available
+
+    # =================================================================
+    # Clean model data
+    # =================================================================
+
+    def prepare_model_dataframe(
+        self,
+        data: pd.DataFrame,
+        require_target: bool = True,
+    ) -> pd.DataFrame:
+
+        data = data.copy()
+
+        missing = [
+            column
+            for column in self.available_training_columns
+            if column not in data.columns
+        ]
+
+        if missing:
+            print("\nWARNING: Missing model features:")
+
+            for column in missing:
+                print(f"{column}")
+
+        available = self.get_available_training_columns(data)
+
+        if len(available) < 10:
+            raise ValueError(
+                "Too few model features available. "
+                f"Found {len(available)}."
+            )
+
+        self.feature_columns = available
+
+        # -------------------------------------------------------------
+        # Numeric cleanup
+        # -------------------------------------------------------------
+
+        for column in available:
+
+            data[column] = pd.to_numeric(
+                data[column],
+                errors="coerce",
+            )
+
+            data[column] = data[column].replace(
+                [np.inf, -np.inf],
+                np.nan,
+            )
+
+            data[column] = data[column].clip(
+                self.config.clip_feature_min,
+                self.config.clip_feature_max,
+            )
+
+        # -------------------------------------------------------------
+        # Target
+        # -------------------------------------------------------------
+
+        if require_target:
+
+            if (
+                self.config.target_column
+                not in data.columns
+            ):
+
+                raise ValueError(
+                    f"Missing target column: "
+                    f"{self.config.target_column}"
+                )
+
+            data[self.config.target_column] = (
+                pd.to_numeric(
+                    data[
+                        self.config.target_column
+                    ],
+                    errors="coerce",
+                )
+            )
+
+            data = data.dropna(
+                subset=[
+                    self.config.target_column
+                ]
+            )
+
+            # Convert:
+            #
+            # 1 -> 0
+            # 2 -> 1
+            # 3 -> 2
+            #
+            data["_Target"] = (
+                data[
+                    self.config.target_column
+                ].astype(int)
+                - 1
+            )
+
+        # -------------------------------------------------------------
+        # Sort
+        # -------------------------------------------------------------
+
+        data = data.sort_values(
+            [
+                self.config.date_column,
+                self.config.ticker_column,
+            ]
+        )
+
+        return data
+
+    # =================================================================
+    # Load training data
+    # =================================================================
+
+    def load_train_data(
+        self,
+        filename: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        Load BOTH source files.
+
+        ainyfin_data.csv:
+            Daily prices and bhsScore target.
+
+        financial_data.csv:
+            SEC quarterly fundamentals.
+
+        The two files are combined inside build_features().
+        """
+        training_filename = (
+            filename or self.config.training_file
+        )
+        financial_filename = self.config.financial_file
+
+        print("\nLoading AinyFin source datasets...")
+
+        # -------------------------------------------------------------
+        # Daily price / target source
+        # -------------------------------------------------------------
+        if not os.path.exists(training_filename):
+            raise FileNotFoundError(
+                f"Training file not found: {training_filename}"
+            )
+
+        print(
+            f"Reading daily/target data: "
+            f"{training_filename}"
+        )
+
+        price_data = pd.read_csv(
+            training_filename
+        )
+
+        print(
+            f"  Daily source: "
+            f"{len(price_data):,} rows / "
+            f"{len(price_data.columns)} columns"
+        )
+
+        # -------------------------------------------------------------
+        # SEC fundamental source
+        # -------------------------------------------------------------
+        if not os.path.exists(financial_filename):
+            raise FileNotFoundError(
+                f"Financial file not found: {financial_filename}"
+            )
+
+        print(
+            f"Reading SEC fundamentals: "
+            f"{financial_filename}"
+        )
+
+        financial_data = pd.read_csv(
+            financial_filename
+        )
+
+        print(
+            f"  Financial source: "
+            f"{len(financial_data):,} rows / "
+            f"{len(financial_data.columns)} columns"
+        )
+
+        print("\nFinancial source schema audit:")
+        print(self.audit_source_columns(financial_data).to_string(index=False))
+
+        # -------------------------------------------------------------
+        # Build combined feature dataset
+        # -------------------------------------------------------------
+        data = self.build_features(
+            price_data,
+            financial_data=financial_data,
+        )
+
+        data = self.prepare_model_dataframe(
+            data,
+            require_target=True,
+        )
+
+        print(
+            f"\nFinal modeling dataset: "
+            f"{len(data):,} rows / "
+            f"{len(self.feature_columns)} model features"
+        )
+
+        print(
+            f"Date range: "
+            f"{data[self.config.date_column].min()} "
+            f"to "
+            f"{data[self.config.date_column].max()}"
+        )
+
+        print("\nTarget distribution:")
+
+        print(
+            data[
+                self.config.target_column
+            ]
+            .value_counts(
+                normalize=True
+            )
+            .sort_index()
+        )
+
+        # Audit how many daily rows actually received fundamentals.
+        if "FinancialDate" in data.columns:
+            fundamental_coverage = (
+                data["FinancialDate"].notna().mean()
+            )
+            print(
+                "\nFundamental coverage: "
+                f"{fundamental_coverage:.2%}"
+            )
+
+        return data
+
+    # =================================================================
+    # Chronological split
+    # =================================================================
+
+    def chronological_split(
+        self,
+        data: pd.DataFrame,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+
+        dates = np.sort(
+            data[
+                self.config.date_column
+            ].dropna().unique()
+        )
+
+        split_index = int(
+            len(dates)
+            * (
+                1.0
+                -
+                self.config.chronological_test_fraction
+            )
+        )
+
+        split_date = dates[
+            split_index
+        ]
+
+        train = data[
+            data[
+                self.config.date_column
+            ]
+            < split_date
+        ].copy()
+
+        test = data[
+            data[
+                self.config.date_column
+            ]
+            >= split_date
+        ].copy()
+
+        return train, test
+
+    # =================================================================
+    # Create model
+    # =================================================================
+
+    def create_model(
+        self,
+    ) -> XGBClassifier:
+
+        return XGBClassifier(
+
+            objective=self.config.objective,
+
+            num_class=3,
+
+            n_estimators=self.config.n_estimators,
+
+            max_depth=self.config.max_depth,
+
+            learning_rate=self.config.learning_rate,
+
+            subsample=self.config.subsample,
+
+            colsample_bytree=self.config.colsample_bytree,
+
+            min_child_weight=self.config.min_child_weight,
+
+            reg_alpha=self.config.reg_alpha,
+
+            reg_lambda=self.config.reg_lambda,
+
+            eval_metric=self.config.eval_metric,
+
+            random_state=self.config.random_state,
+
+            n_jobs=self.config.n_jobs,
+
+            tree_method="hist",
+
+        )
+
+    # =================================================================
+    # Metrics
+    # =================================================================
+
+    def evaluate_predictions(
+        self,
+        y_true,
+        y_pred,
+        title: str = "Evaluation",
+    ) -> dict[str, float]:
+
+        accuracy = accuracy_score(
+            y_true,
+            y_pred,
+        )
+
+        macro_f1 = f1_score(
+            y_true,
+            y_pred,
+            average="macro",
+        )
+
+        weighted_f1 = f1_score(
+            y_true,
+            y_pred,
+            average="weighted",
+        )
+
+        balanced_accuracy = (
+            balanced_accuracy_score(
+                y_true,
+                y_pred,
+            )
+        )
+
+        print(
+            f"\n=== {title} ==="
+        )
+
+        print(
+            f"Accuracy: "
+            f"{accuracy:.4f}"
+        )
+
+        print(
+            f"Balanced Accuracy: "
+            f"{balanced_accuracy:.4f}"
+        )
+
+        print(
+            f"Macro F1: "
+            f"{macro_f1:.4f}"
+        )
+
+        print(
+            f"Weighted F1: "
+            f"{weighted_f1:.4f}"
+        )
+
+        print(
+            "\nClassification Report:"
+        )
+
+        print(
+            classification_report(
+                y_true,
+                y_pred,
+                digits=4,
+                zero_division=0,
+            )
+        )
+
+        print(
+            "Confusion Matrix:"
+        )
+
+        print(
+            confusion_matrix(
+                y_true,
+                y_pred,
+            )
+        )
+
+        return {
+            "accuracy": accuracy,
+            "balanced_accuracy": balanced_accuracy,
+            "macro_f1": macro_f1,
+            "weighted_f1": weighted_f1,
+        }
+
+    # =================================================================
+    # Majority baseline
+    # =================================================================
+
+    def evaluate_baseline(
+        self,
+        y,
+    ):
+
+        values, counts = np.unique(
+            y,
+            return_counts=True,
+        )
+
+        majority_class = values[
+            np.argmax(counts)
+        ]
+
+        predictions = np.full(
+            len(y),
+            majority_class,
+        )
+
+        print(
+            "\n=== Majority-Class Baseline ==="
+        )
+
+        self.evaluate_predictions(
+            y,
+            predictions,
+            title="Majority Baseline",
+        )
+
+        print(
+            f"Majority class: "
+            f"{majority_class}"
+        )
+
+    # =================================================================
+    # Walk-forward validation
+    # =================================================================
+
+    def walk_forward_validation(
+        self,
+        data: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Expanding-window walk-forward validation.
+
+        Example:
+
+            Fold 1:
+                Train: oldest -> T1
+                Test:  T1 -> T2
+
+            Fold 2:
+                Train: oldest -> T2
+                Test:  T2 -> T3
+
+            ...
+
+        This is the primary validation method.
+        """
+
+        print(
+            "\n"
+            + "=" * 70
+        )
+
+        print(
+            "=== "
+            f"{self.config.n_walk_forward_folds}"
+            "-Fold Walk-Forward Validation ==="
+        )
+
+        print(
+            "=" * 70
+        )
+
+        data = data.sort_values(
+            self.config.date_column
+        )
+
+        unique_dates = np.array(
+            sorted(
+                data[
+                    self.config.date_column
+                ].dropna().unique()
+            )
+        )
+
+        n_dates = len(
+            unique_dates
+        )
+
+        if n_dates < 10:
+
+            raise ValueError(
+                "Not enough unique dates "
+                "for walk-forward validation."
+            )
+
+        # -------------------------------------------------------------
+        # Divide the historical period into approximately equal
+        # validation windows.
+        # -------------------------------------------------------------
+
+        fold_boundaries = np.linspace(
+            0,
+            n_dates,
+            self.config.n_walk_forward_folds + 2,
+            dtype=int,
+        )
+
+        results = []
+
+        for fold in range(
+            self.config.n_walk_forward_folds
+        ):
+
+            train_end_index = (
+                fold_boundaries[
+                    fold + 1
+                ]
+            )
+
+            validation_start_index = (
+                train_end_index
+            )
+
+            validation_end_index = (
+                fold_boundaries[
+                    fold + 2
+                ]
+            )
+
+            train_end_date = unique_dates[
+                train_end_index - 1
+            ]
+
+            validation_start_date = (
+                unique_dates[
+                    validation_start_index
+                ]
+            )
+
+            validation_end_date = (
+                unique_dates[
+                    validation_end_index - 1
+                ]
+            )
+
+            train = data[
+                data[
+                    self.config.date_column
+                ]
+                <= train_end_date
+            ]
+
+            validation = data[
+                (
+                    data[
+                        self.config.date_column
+                    ]
+                    >= validation_start_date
+                )
+                &
+                (
+                    data[
+                        self.config.date_column
+                    ]
+                    <= validation_end_date
+                )
+            ]
+
+            if len(train) < self.config.min_train_rows:
+
+                print(
+                    f"\nFold {fold + 1}: "
+                    f"SKIPPED — only "
+                    f"{len(train):,} training rows."
+                )
+
+                continue
+
+            X_train = train[
+                self.feature_columns
+            ]
+
+            y_train = train[
+                "_Target"
+            ]
+
+            X_validation = validation[
+                self.feature_columns
+            ]
+
+            y_validation = validation[
+                "_Target"
+            ]
+
+            # ---------------------------------------------------------
+            # Missing-value handling
+            #
+            # XGBoost handles NaN natively.
+            # ---------------------------------------------------------
+
+            model = self.create_model()
+
+            model.fit(
+                X_train,
+                y_train,
+            )
+
+            predictions = model.predict(
+                X_validation
+            )
+
+            metrics = self.evaluate_predictions(
+                y_validation,
+                predictions,
+                title=f"Fold {fold + 1}",
+            )
+
+            results.append(
+                {
+                    "fold": fold + 1,
+
+                    "train_rows": len(train),
+
+                    "validation_rows": len(validation),
+
+                    "train_end": train_end_date,
+
+                    "validation_start":
+                        validation_start_date,
+
+                    "validation_end":
+                        validation_end_date,
+
+                    **metrics,
+                }
+            )
+
+        results_df = pd.DataFrame(
+            results
+        )
+
+        if not results_df.empty:
 
             print(
-                f"Fold {fold}/{n_splits} - Accuracy: {fold_acc * 100:.2f}% | Weighted"
-                f" F1: {fold_f1:.4f}"
+                "\n"
+                + "-" * 70
             )
 
-            # 4. Out-of-fold aggregate summary
-            mean_acc = np.mean(cv_accuracies)
-            std_acc = np.std(cv_accuracies)
-            mean_f1 = np.mean(cv_f1_scores)
+            print(
+                "Walk-forward Accuracy: "
+                f"{results_df['accuracy'].mean():.4f} "
+                f"+/- "
+                f"{results_df['accuracy'].std():.4f}"
+            )
 
-            print("-" * 50)
-            print(f"CV Mean Accuracy: {mean_acc * 100:.2f}% (+/- {std_acc * 100:.2f}%)")
-            print(f"CV Mean Weighted F1: {mean_f1:.4f}")
-            print("-" * 50)
+            print(
+                "Walk-forward Balanced Accuracy: "
+                f"{results_df['balanced_accuracy'].mean():.4f}"
+            )
 
-        # 5. Retrain final model on 100% of the dataset for production deployment
-        print("Retraining final production model on entire dataset...")
+            print(
+                "Walk-forward Macro F1: "
+                f"{results_df['macro_f1'].mean():.4f}"
+            )
 
-        """
-        final_xg_model = XGBClassifier(
-            n_estimators=self.n_estimators,
-            learning_rate=0.05,
-            max_depth=5,
-            objective="multi:softprob",
-            eval_metric="mlogloss",
-            random_state=42,
+            print(
+                "Walk-forward Weighted F1: "
+                f"{results_df['weighted_f1'].mean():.4f}"
+            )
+
+            print(
+                "-" * 70
+            )
+
+        return results_df
+
+    # =================================================================
+    # Chronological test
+    # =================================================================
+
+    def chronological_test(
+        self,
+        data: pd.DataFrame,
+    ):
+
+        print(
+            "\n"
+            + "=" * 70
         )
-        """
 
-        final_xg_model = XGBClassifier(
-            n_estimators=100,
-            max_depth=3,  # Reduce depth from 5 to 3
-            learning_rate=0.03,
-            subsample=0.8,  # Randomly sample 80% of rows per tree
-            colsample_bytree=0.8,  # Randomly sample 80% of features per tree
-            reg_alpha=1.0,  # L1 regularization
-            reg_lambda=1.0,  # L2 regularization
+        print(
+            "=== Chronological Test ==="
         )
 
-        final_xg_model.fit(X, y)
+        print(
+            "=" * 70
+        )
 
-        # 6. Save final production model locally
-        local_path = f"/tmp/{XGBMODEL_FILENAME}"
-        joblib.dump(final_xg_model, local_path)
-        print(f"Model successfully saved to {local_path}")
+        train, test = (
+            self.chronological_split(
+                data
+            )
+        )
 
-         # 2. Upload to Google Cloud Storage
-        #storage_client = storage.Client()
-        #bucket = storage_client.bucket(BUCKET_NAME)
-        #blob_path = f"{DIRECTORY_NAME}/{MODEL_FILENAME}"
-        #blob = bucket.blob(blob_path)
-        #blob.upload_from_filename(local_path)
-        #print(f"Successfully uploaded model to gs://{blob_path}")
+        print(
+            f"Training rows: "
+            f"{len(train):,}"
+        )
 
-        # 3. Notify App Engine to reload the model from GCS
-        try:
-            reload_endpoint = f"{APP_ENGINE_URL}/reload-model"
-            resp = requests.post(reload_endpoint, timeout=10)
-            print(f"App Engine notification status: {resp.status_code} - {resp.text}")
-        except Exception as e:
-            print(f"Failed to notify App Engine service: {e}")
+        print(
+            f"Test rows: "
+            f"{len(test):,}"
+        )
 
-        return True
+        print(
+            f"Training end: "
+            f"{train[self.config.date_column].max()}"
+        )
+
+        print(
+            f"Test start: "
+            f"{test[self.config.date_column].min()}"
+        )
+
+        # -------------------------------------------------------------
+        # Baseline
+        # -------------------------------------------------------------
+
+        self.evaluate_baseline(
+            test["_Target"].values
+        )
+
+        # -------------------------------------------------------------
+        # Train
+        # -------------------------------------------------------------
+
+        X_train = train[
+            self.feature_columns
+        ]
+
+        y_train = train[
+            "_Target"
+        ]
+
+        X_test = test[
+            self.feature_columns
+        ]
+
+        y_test = test[
+            "_Target"
+        ]
+
+        model = self.create_model()
+
+        model.fit(
+            X_train,
+            y_train,
+        )
+
+        predictions = model.predict(
+            X_test
+        )
+
+        probabilities = model.predict_proba(
+            X_test
+        )
+
+        metrics = self.evaluate_predictions(
+            y_test,
+            predictions,
+            title="Chronological Test",
+        )
+
+        # -------------------------------------------------------------
+        # Prediction frame
+        # -------------------------------------------------------------
+
+        prediction_df = test[
+            [
+                self.config.ticker_column,
+                self.config.date_column,
+            ]
+        ].copy()
+
+        prediction_df[
+            "Actual_Class"
+        ] = y_test.values
+
+        prediction_df[
+            "Predicted_Class"
+        ] = predictions
+
+        prediction_df[
+            "P_Sell"
+        ] = probabilities[:, 0]
+
+        prediction_df[
+            "P_Hold"
+        ] = probabilities[:, 1]
+
+        prediction_df[
+            "P_Buy"
+        ] = probabilities[:, 2]
+
+        prediction_df[
+            "Confidence"
+        ] = probabilities.max(
+            axis=1
+        )
+
+        sorted_probabilities = (
+            np.sort(
+                probabilities,
+                axis=1
+            )
+        )
+
+        prediction_df[
+            "Confidence_Margin"
+        ] = (
+            sorted_probabilities[:, -1]
+            -
+            sorted_probabilities[:, -2]
+        )
+
+        prediction_df[
+            "Predicted_Signal"
+        ] = [
+            self.config.target_labels.get(
+                int(x),
+                "UNKNOWN",
+            )
+            for x in predictions
+        ]
+
+        return (
+            model,
+            prediction_df,
+            metrics,
+        )
+
+    # =================================================================
+    # Feature importance
+    # =================================================================
+
+    def compute_feature_importance(
+        self,
+        model: Optional[XGBClassifier] = None,
+    ) -> pd.DataFrame:
+
+        model = model or self.model
+
+        if model is None:
+
+            raise ValueError(
+                "No trained model available."
+            )
+
+        importance = (model.feature_importances_)
+
+        result = pd.DataFrame(
+            {
+                "Feature":
+                    self.feature_columns,
+                "Importance":
+                    importance,
+            }
+        )
+
+        result = result.sort_values(
+            "Importance",
+            ascending=False,
+        ).reset_index(
+            drop=True
+        )
+
+        self.feature_importance = result
+
+        print(
+            "\n"
+            + "=" * 70
+        )
+
+        print(
+            "=== Global Feature Importance ==="
+        )
+
+        print(
+            result.to_string(
+                index=False
+            )
+        )
+
+        return result
+
+    # =================================================================
+    # Train production model
+    # =================================================================
+
+    def train(
+        self,
+        data: pd.DataFrame,
+    ):
+
+        print(
+            "\n"
+            + "=" * 70
+        )
+
+        print(
+            "=== Training Production Model ==="
+        )
+
+        print(
+            "=" * 70
+        )
+
+        X = data[
+            self.feature_columns
+        ]
+
+        y = data[
+            "_Target"
+        ]
+
+        print(
+            f"Training rows: "
+            f"{len(X):,}"
+        )
+
+        print(
+            f"Features: "
+            f"{len(self.feature_columns)}"
+        )
+
+        self.model = self.create_model()
+
+        self.model.fit(
+            X,
+            y,
+        )
+
+        self.compute_feature_importance(
+            self.model
+        )
+
+        return self.model
+
+    # =================================================================
+    # Probability prediction
+    # =================================================================
+
+    def predict(
+        self,
+        data: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Predict signals with probabilities.
+
+        Returns:
+
+            Ticker
+            Date
+            Predicted_Signal
+            P_Sell
+            P_Hold
+            P_Buy
+            Confidence
+            Confidence_Margin
+            Signal_Strength
+        """
+
+        if self.model is None:
+
+            raise ValueError(
+                "Model has not been trained."
+            )
+
+        data = data.copy()
+
+        missing = [
+            column
+            for column in self.feature_columns
+            if column not in data.columns
+        ]
+
+        if missing:
+
+            raise ValueError(
+                "Prediction data is missing "
+                f"features: {missing}"
+            )
+
+        X = data[
+            self.feature_columns
+        ]
+
+        probabilities = (
+            self.model.predict_proba(
+                X
+            )
+        )
+
+        predictions = (
+            probabilities.argmax(
+                axis=1
+            )
+        )
+
+        result = data[
+            [
+                c
+                for c in [
+                    self.config.ticker_column,
+                    self.config.date_column,
+                ]
+                if c in data.columns
+            ]
+        ].copy()
+
+        result[
+            "Predicted_Class"
+        ] = predictions
+
+        result[
+            "P_Sell"
+        ] = probabilities[:, 0]
+
+        result[
+            "P_Hold"
+        ] = probabilities[:, 1]
+
+        result[
+            "P_Buy"
+        ] = probabilities[:, 2]
+
+        result[
+            "Confidence"
+        ] = probabilities.max(
+            axis=1
+        )
+
+        sorted_probabilities = (
+            np.sort(
+                probabilities,
+                axis=1
+            )
+        )
+
+        result[
+            "Confidence_Margin"
+        ] = (
+            sorted_probabilities[:, -1]
+            -
+            sorted_probabilities[:, -2]
+        )
+
+        result[
+            "Predicted_Signal"
+        ] = [
+            self.config.target_labels.get(
+                int(x),
+                "UNKNOWN",
+            )
+            for x in predictions
+        ]
+
+        # -------------------------------------------------------------
+        # Signal strength
+        #
+        # This is deliberately descriptive.
+        # Do not interpret it as a validated investment threshold yet.
+        # -------------------------------------------------------------
+
+        result[
+            "Signal_Strength"
+        ] = result.apply(
+            lambda row:
+                self._signal_strength(
+                    row["Confidence"],
+                    row["Confidence_Margin"],
+                ),
+            axis=1,
+        )
+
+        # -------------------------------------------------------------
+        # No-trade layer
+        #
+        # We retain the model's class prediction but distinguish it
+        # from an actionable signal.
+        # -------------------------------------------------------------
+
+        result[
+            "Action"
+        ] = result.apply(
+            self._action_from_prediction,
+            axis=1,
+        )
+
+        return result
+
+    # =================================================================
+    # Signal strength
+    # =================================================================
+
+    @staticmethod
+    def _signal_strength(
+        confidence: float,
+        margin: float,
+    ) -> str:
+
+        if confidence >= 0.65 and margin >= 0.20:
+            return "STRONG"
+
+        if confidence >= 0.55 and margin >= 0.10:
+            return "MODERATE"
+
+        return "WEAK"
+
+    # =================================================================
+    # Action layer
+    # =================================================================
+
+    def _action_from_prediction(
+        self,
+        row,
+    ) -> str:
+
+        confidence = float(
+            row["Confidence"]
+        )
+
+        margin = float(
+            row["Confidence_Margin"]
+        )
+
+        signal = row[
+            "Predicted_Signal"
+        ]
+
+        # -------------------------------------------------------------
+        # IMPORTANT:
+        #
+        # These are NOT claimed to be optimal thresholds.
+        # They are deliberately conservative defaults until confidence
+        # calibration and return-bucket analysis have been performed.
+        # -------------------------------------------------------------
+
+        if (
+            confidence < 0.50
+            or margin < 0.05
+        ):
+
+            return "NO_TRADE"
+
+        return signal
+
+    # =================================================================
+    # Save model
+    # =================================================================
+
+    def save_model(
+        self,
+        filename: Optional[str] = None,
+    ):
+        if self.model is None:
+            raise ValueError("No model to save.")
+
+        filename = (filename or self.config.model_file)
+        self.model.save_model(filename)
+        print(f"\nModel saved to: " f"{filename}")
+
+        # -------------------------------------------------------------
+        # Save feature schema
+        # -------------------------------------------------------------
+
+        schema_file = (filename + ".features.txt")
+
+        with open(
+            schema_file,
+            "w",
+            encoding="utf-8",
+        ) as f:
+            for feature in self.feature_columns:
+                f.write(feature + "\n")
+
+        print(f"Feature schema saved to: " f"{schema_file}")
+
+    # =================================================================
+    # Load model
+    # =================================================================
+
+    def load_model(
+        self,
+        filename: Optional[str] = None,
+    ):
+        filename = (
+            filename
+            or self.config.model_file
+        )
+
+        if not os.path.exists(filename):
+            raise FileNotFoundError(
+                f"Model file not found: "
+                f"{filename}"
+            )
+
+        self.model = self.create_model()
+        self.model.load_model(filename)
+
+        schema_file = (filename+ ".features.txt")
+
+        if os.path.exists(
+            schema_file
+        ):
+            with open(
+                schema_file,
+                "r",
+                encoding="utf-8",
+            ) as f:
+                self.feature_columns = [
+                    line.strip()
+                    for line in f
+                    if line.strip()
+                ]
+        else:
+            self.feature_columns = (
+                self.available_training_columns
+            )
+
+        print(
+            f"Model loaded from: "
+            f"{filename}"
+        )
+
+        print(
+            f"Feature schema: "
+            f"{len(self.feature_columns)} features"
+        )
+
+        return self.model
+
+    # =================================================================
+    # End-to-end training
+    # =================================================================
+
+    def run_training(self, filename: Optional[str] = None):
+        print("\n" + "=" * 70)
+        print("=== Starting AinyFin Training ===")
+        print("=" * 70)
+        print(datetime.now())
+
+        # -------------------------------------------------------------
+        # Load
+        # -------------------------------------------------------------
+
+        data = self.load_train_data(filename)
+
+        # -------------------------------------------------------------
+        # Walk-forward validation
+        # -------------------------------------------------------------
+
+        walk_forward_results = (self.walk_forward_validation(data))
+
+        # -------------------------------------------------------------
+        # Chronological holdout
+        # -------------------------------------------------------------
+
+        (
+            chronological_model,
+            chronological_predictions,
+            chronological_metrics,
+        ) = self.chronological_test(data)
+
+        # -------------------------------------------------------------
+        # Train production model on ALL historical data
+        # -------------------------------------------------------------
+
+        self.train(data)
+
+        # -------------------------------------------------------------
+        # Save
+        # -------------------------------------------------------------
+
+        self.save_model()
+        print("\n"+ "=" * 70)
+        print("=== AinyFin Training Complete ===")
+        print("=" * 70)
+
+        return {
+            "data": data,
+
+            "walk_forward_results":
+                walk_forward_results,
+
+            "chronological_predictions":
+                chronological_predictions,
+
+            "chronological_metrics":
+                chronological_metrics,
+
+            "model":
+                self.model,
+
+            "feature_importance":
+                self.feature_importance,
+        }
 
 
-    def init_runtime(self):
-        local_path = f"/tmp/{XGBMODEL_FILENAME}"
-        self.xg_model = joblib.load(local_path)
-        print("Model running:",  self.xg_model)
+# =====================================================================
+# Main
+# =====================================================================
 
-        # 1. Get raw normalized importance scores
-        importances = self.xg_model.feature_importances_
-
-        # 2. Map scores to feature names in a clean DataFrame
-        feature_imp_df = pd.DataFrame({
-            'Feature': self.xg_model.feature_names_in_,
-            'Importance': importances
-        }).sort_values(by='Importance', ascending=False)
-        print(feature_imp_df)
-
-
-    def test_model(self):
-        # 1. Input
-        X_test, y_test = self.load_test_data()
-        #print(f"Test data:\n", X_test, y_test )
-
-        # 3. Make Test predictions
-        y_pred = self.xg_model.predict(X_test)
-        predictions = [round(value) for value in y_pred]
-        #print(f"Test Predictions: {predictions}\n")
-        out_pred_desc = [AinySchema.BHS_DESCS[value] for value in y_pred]
-        for ticker, desc in zip(self.symbols, out_pred_desc):
-          print(f"{ticker}: {desc}")
-
-        le = LabelEncoder()
-        y_test_encoded = le.fit_transform(y_test)
-        accuracy = accuracy_score(y_test_encoded, predictions)
-        print("xg_model Accuracy: %.2f%%\n" % (accuracy * 100.0))
-        print(classification_report(y_test, y_pred))
-        print(confusion_matrix(y_test, y_pred))
-
-
-    def predict(self, tickerlist, input_df):
-        out_pred = self.xg_model.predict(input_df)
-        out_pred_desc = [AinySchema.BHS_DESCS[value] for value in out_pred]
-        # Map ticker to description into a dict
-        ticker_bhs_map = dict(zip(tickerlist, out_pred_desc))
-        #print(f"BHS Predictions: {ticker_bhs_map}")
-
-        # Or print line-by-line
-        for ticker, desc in zip(tickerlist, out_pred_desc):
-          print(f"{ticker}: {desc}")
-
-
-def main(args:list):
-    print(f"=== Starting Weekly Training Job Execution: {datetime.now(ZoneInfo('America/New_York')).date()} ===")
-    modelBuilder = ModelBuilder("xg",100)
-    feature_df = modelBuilder.load_train_data()
-    success = modelBuilder.train(feature_df)
-    success = True
-    if success == True:
-        print("=== Training Job Completed Successfully ===")
-        modelBuilder.init_runtime()
-        modelBuilder.test_model()
-    else:
-        print("Model Building failed")
+def main():
+    builder = ModelBuilder("xg")
+    results = builder.run_training()
+    print("\nFinal model features:")
+    for i, feature in enumerate(
+        builder.feature_columns,
+        start=1,
+    ):
+        print(f"{i:3d}. {feature}")
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+
+    main()

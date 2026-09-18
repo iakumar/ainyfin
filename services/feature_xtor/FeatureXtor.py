@@ -1,3 +1,5 @@
+import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -6,7 +8,6 @@ import pandas as pd
 import yfinance as yf
 
 from services.consts.AinySchema import AinySchema
-
 from .EdgarXDI import EdgarXDI
 
 
@@ -14,382 +15,184 @@ class FeatureExtractor:
 
     def __init__(self, usecase: str):
         self.usecase = usecase
-        self.symbols:list[str] = [
-            'AAPL', 'AMD', 'AMZN', 'ABNB', 'CBRE', 'CMCSA', 'CRWD', 'DAL', 'DUK', 'EOG', 'ETN', 'GE', 'GEV', 'GOOG', 'GOOGL', 'GRMN', 'GS',
-            'HOOD', 'ICE', 'INTU', 'IQV', 'IR', 'JNJ', 'JPM', 'KO', 'LRCX', 'LRCX', 'LYB', 'MANH', 'MDLZ', 'META', 'MRK', 'MSFT', 'NET', 'NFLX',
-            'NVDA', 'PANW', 'PG', 'PLTR', 'PSX', 'RH', 'SNOW', 'SO', 'T', 'TMO', 'TSLA', 'TT', 'TROW', 'V', 'WFC', 'WMT', 'XOM', 'XYZ', 'Z'
+        self.look_ahead_days = 30
+
+        self.symbols: list[str] = [
+            # --- Original List ---
+            'AAPL', 'AMD', 'AMZN', 'ABNB', 'CBRE', 'CMCSA', 'CRWD', 'DAL', 'DUK', 'EOG',
+            'ETN', 'GE', 'GEV', 'GOOG', 'GOOGL', 'GRMN', 'GS', 'HOOD', 'ICE', 'INTU',
+            'IQV', 'IR', 'JNJ', 'JPM', 'KO', 'LRCX', 'LYB', 'MANH', 'MDLZ', 'META',
+            'MRK', 'MSFT', 'NET', 'NFLX', 'NVDA', 'PANW', 'PG', 'PLTR', 'PSX', 'RH',
+            'SNOW', 'SO', 'T', 'TMO', 'TSLA', 'TT', 'TROW', 'V', 'WFC', 'WMT',
+            'XOM', 'XYZ', 'Z',
+
+            # --- Appended S&P 500 Components ---
+            'A', 'AAL', 'ABBV', 'ABT', 'ACGL', 'ACN', 'ADBE', 'ADI', 'ADM',
+            'ADP', 'ADSK', 'AEE', 'AEP', 'AES', 'AFL', 'AIG', 'AIZ', 'AJG', 'AKAM',
+            'ALB', 'ALGN', 'ALL', 'ALLE', 'ALNT', 'AMCR', 'AME', 'AMGN', 'AMP', 'AMT',
+            'ANET', 'AON', 'APA', 'APD', 'APH', 'APTV', 'ARE', 'ATO',
+            'AVB', 'AVGO', 'AVY', 'AWK', 'AXON', 'AXP', 'BA', 'BAC', 'BALL', 'BAX',
+            'BBY', 'BDX', 'BEN', 'BG', 'BIIB', 'BIO', 'BKNG', 'BKR',
+            'BLK', 'BLDR', 'BMY', 'BR', 'BRO', 'BSX', 'BWA', 'BXP', 'C',
+            'CAG', 'CAH', 'CARR', 'CAT', 'CB', 'CBOE', 'CCI', 'CCK', 'CCL', 'CDNS',
+            'CDW', 'CE', 'CEG', 'CF', 'CFG', 'CHD', 'CHRW', 'CHTR', 'CI', 'CINF',
+            'CL', 'CLX', 'CME', 'CMG', 'CMI', 'CMS', 'CNC',
+            'CNP', 'COF', 'COO', 'COP', 'COST', 'CPAY', 'CPB', 'CPRT', 'CPT', 'CRL',
+            'CRM', 'CSCO', 'CSGP', 'CSX', 'CTAS', 'CTSH', 'CTVA', 'CVS', 'CVX',
+            'CZR', 'D', 'DE', 'DELL', 'DG', 'DGX', 'DHI', 'DHR', 'DIS',
+            'DLR', 'DLTR', 'DOC', 'DOV', 'DOW', 'DPZ', 'DRI', 'DTE', 'DVN', 'DXCM',
+            'EA', 'EBAY', 'ECL', 'ED', 'EFX', 'EG', 'EIX', 'EL', 'ELV', 'EME', 'EMN',
+            'EMR', 'ENPH', 'EPAM', 'EQIX', 'EQR', 'EQT', 'ES', 'ESS', 'ETR', 'ETSY',
+            'EVRG', 'EW', 'EXC', 'EXPD', 'EXPE', 'EXR', 'F', 'FANG', 'FAST', 'FCX',
+            'FDS', 'FDX', 'FE', 'FICO', 'FIS', 'FITB', 'FMC', 'FOX',
+            'FOXA', 'FRT', 'FSLR', 'FTNT', 'FTV', 'GD', 'GEN', 'GILD', 'GIS', 'GL',
+            'GLW', 'GM', 'GNRC', 'GPC', 'GPN', 'GWW', 'HAL', 'HAS', 'HBAN', 'HCA',
+            'HD', 'HIG', 'HII', 'HLT', 'HON', 'HPE', 'HPQ', 'HRL',
+            'HSY', 'HUBB', 'HUM', 'HWM', 'IBM', 'IDXX', 'IEX', 'IFF', 'ILMN', 'INCY',
+            'INTC', 'INVH', 'IRM', 'ISRG', 'IT', 'ITW', 'IVZ', 'J', 'JBHT', 'JCI',
+            'JKHY', 'KDP', 'KEY', 'KEYS', 'KHC', 'KIM', 'KLAC', 'KMB',
+            'KMI', 'KMX', 'KO', 'KR', 'KVUE', 'L', 'LDOS', 'LEN', 'LH', 'LHX', 'LIN',
+            'LKQ', 'LLY', 'LMT', 'LNT', 'LOW', 'LULU', 'LUV', 'LVS', 'LW', 'LYV',
+            'MA', 'MAA', 'MAR', 'MAS', 'MCD', 'MCHP', 'MCK', 'MCO', 'MDT', 'MET',
+            'MGM', 'MHK', 'MKC', 'MKTX', 'MLM', 'MMM', 'MNST', 'MO', 'MOH',
+            'MOS', 'MPC', 'MPWR', 'MRNA', 'MS', 'MSCI', 'MSI', 'MSM', 'MTB', 'MTCH',
+            'MTD', 'MU', "NCLH", 'NDAQ', 'NDSN', 'NEE', 'NEM', 'NI', 'NKE', 'NOC',
+            'NOW', 'NRG', 'NSC', 'NTAP', 'NTRS', 'NUE', 'NVR', 'NWS', 'NWSA', 'NXPI',
+            'O', 'ODFL', 'OKE', 'OMC', 'ON', 'ORCL', 'ORLY', 'OTIS', 'OXY', 'PARA',
+            'PAYC', 'PAYX', 'PCAR', 'PCG', 'PKG', 'PM', 'PNC', 'PNR', 'PNW',
+            'PODD', 'POOL', 'PPG', 'PPL', 'PRU', 'PSA', 'PTC', 'PWR', 'PYPL', 'QCOM',
+            'QRVO', 'RCL', 'REG', 'REGN', 'RF', 'RHI', 'RJF', 'RL', 'RMD', 'ROK',
+            'ROL', 'ROP', 'ROST', 'RSG', 'RTX', 'RVTY', 'SBAC', 'SBUX', 'SCHW', 'SHW',
+            'SJM', 'SLB', 'SNA', 'SNPS', 'SPG', 'SPGI', 'SRE', 'STE', 'STT', 'STX',
+            'STZ', 'SWK', 'SWKS', 'SYK', 'SYY', 'TAP', 'TDG', 'TDY', 'TECH', 'TEL',
+            'TER', 'TFC', 'TFX', 'TGT', 'TJX', 'TMUS', 'TPR', 'TRGP', 'TRMB', 'TRV',
+            'TSCO', 'TSN', 'TTWO', 'TXN', 'TXT', 'TYL', 'UA', 'UAA', 'UAL', 'UBER',
+            'UHS', 'UNH', 'UNP', 'UPS', 'URI', 'USB', 'VFC', 'VICI', 'VLO', 'VMC',
+            'VRSK', 'VRSN', 'VRTX', 'VTR', 'VTRS', 'VZ', 'WAB', 'WAT', 'WBD',
+            'WDC', 'WEC', 'WELL', 'WFRD', 'WHR', 'WM', 'WMB', 'WRB', 'WST', 'WTW',
+            'WY', 'WYNN', 'XEL', 'XYL', 'YUM', 'ZBH', 'ZBRA', 'ZTS'
         ]
 
         self.funds:list[str] = [
             '857480610', '857480628', 'AMLP', 'IWN', 'CCMAZ', 'FBCGX', 'FGKFX', 'FBGRX', 'FFSFX', 'FLKSX', 'FXAIX', 'FELV', 'GLD',
             'WFPRX'
         ]
-        self.status:str = ''
+        self.status:str = 'Done'
 
 
     def download(self):
+        self.status = 'Started'
+
         # 1. setup params for start and end
         training_window = 4 * 365
-        look_ahead = 90
         today = datetime.now(timezone.utc).date()
-        start_date = today - timedelta(days=(training_window+look_ahead))
-        end_date = today - timedelta(days= look_ahead)
+        start_date = today - timedelta(days=training_window)
+        end_date = today
 
 
         #2 Price
-        price_df = yf.download(self.symbols, start=start_date, end=end_date, auto_adjust=True)
+        price_df = self.download_prices_in_chunks(self.symbols, start_date, end_date)
         if not price_df.empty:
             # Drop columns where all values are NaN (failed tickers)
             price_df = price_df.dropna(how="all", axis=1)
-            price_df = price_df.stack(level=1, future_stack=True).reset_index()
+            price_df = price_df.loc[:, ~price_df.columns.duplicated()]
+            if isinstance(price_df.columns, pd.MultiIndex):
+                # Stack by 'Ticker' level specifically (usually level 1 or level='Ticker')
+                level_to_stack = "Ticker" if "Ticker" in price_df.columns.names else 1
+                price_df = price_df.stack(level=level_to_stack, future_stack=True).reset_index()
+            else:
+                price_df = price_df.reset_index()
         else:
             print("No price data found for tickers:", self.symbols)
             return pd.DataFrame()
 
         price_df = price_df.sort_values('Date').reset_index(drop=True)
-        price_df["TargetDate"] = price_df["Date"] + pd.to_timedelta(look_ahead+1, unit='D')
         price_df.to_csv(AinySchema.DATA_DIR+'/price.csv')
-
-        """
-        #2 Financials
-        self.downloadFinancials(start_date=start_date, end_date=end_date)
-
-        #3 balancesheet
-        self.downloadBalancesheet(start_date=start_date, end_date=end_date)
-
-        #4 cashflow
-        self.downloadCashflow(start_date=start_date, end_date=end_date)
-
-        #5 misc
-        self.downloadMisc(start_date=start_date, end_date=end_date)
-        """
 
         edgarXDI = EdgarXDI("BHS")
         edgarXDI.downloadFinancialData(self.symbols)
-
         self.status = 'Done'
 
 
-    def downloadFinancials(self, start_date, end_date):
-        raw_dfs = []
-        for symbol in self.symbols:
-            print("Downloading financials for:",symbol)
-            ticker_obj = yf.Ticker(symbol)
-
-            # Fetch financial statements (columns are dates, index are line items)
-            fin = ticker_obj.get_financials(freq="quarterly")
-            if fin is None or fin.empty:
-                continue
-
-            # Transpose so rows are dates and columns are financial line items
-            df = fin.T.reset_index().rename(columns={"index": "Date"})
-            df["Ticker"] = symbol
-            df["Date"] = pd.to_datetime(df["Date"])
-            # Filter: start <= Date <= end
-            df = df[
-                (df["Date"].dt.date >= start_date) & (df["Date"].dt.date <= end_date)
-            ]
-
-            raw_dfs.append(df)
-
-        if not raw_dfs:
-            return
-
-        # -------------------------------------------------------------
-        # Phase 1: Outer Union (Combines all unique columns across stocks)
-        # -------------------------------------------------------------
-        unified_df = pd.concat(raw_dfs, axis=0, ignore_index=True, join="outer")
-
-        # Sort deterministically
-        unified_df = unified_df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-
-        # -------------------------------------------------------------
-        # Phase 2: Standardize & Impute Missing Financial Features
-        # -------------------------------------------------------------
-
-        # Core standardized line items shared across most companies
-        core_features = [
-            "RevenueFromContractWithCustomerExcludingAssessedTax",
-            "OperatingRevenue",
-            "CostOfGoodsAndServicesSold",
-            "GrossProfit",
-            "OperatingExpense",
-            "ResearchAndDevelopment",
-            "SellingGeneralAndAdministration",
-            "SellingAndMarketingExpense",
-            "GeneralAndAdministrativeExpense",
-            "OperatingIncomeLoss",
-            "EBITDA",
-            "NormalizedEBITDA",
-            "EBIT",
-            "NetInterestIncome",
-            "InterestExpense",
-            "InterestIncome",
-            "PretaxIncome",
-            "TaxProvision",
-            "TaxRateForCalcs",
-            "NetIncome",
-            "NetIncomeLoss",
-            "NetIncomeContinuousOperations",
-            "DilutedNIAvailtoComStockholders",
-            "BasicEPS",
-            "EarningsPerShareDiluted",
-            "BasicAverageShares",
-            "WeightedAverageNumberOfDilutedSharesOutstanding",
+    def download_prices_in_chunks(self, symbols, start_date, end_date, chunk_size=50, delay_seconds=5):
+        all_dfs = []
+        # Split list into smaller chunks
+        symbol_chunks = [
+            symbols[i : i + chunk_size] for i in range(0, len(symbols), chunk_size)
         ]
 
-        # Ensure all core columns exist (add as NaN if completely missing from batch)
-        for col in core_features:
-            if col not in unified_df.columns:
-                unified_df[col] = np.nan
-
-        # Fill missing granular line items with 0 (e.g., R&D is 0 for non-tech companies)
-        zero_fill_cols = [
-            "ResearchAndDevelopment",
-            "InterestExpense",
-            "InterestIncome",
-            "TotalUnusualItems",
-        ]
-        for col in zero_fill_cols:
-            if col in unified_df.columns:
-                unified_df[col] = unified_df[col].fillna(0)
-
-        # Calculate resilient fallback metrics if primary metrics are missing
-        if "GrossProfit" in unified_df.columns and "RevenueFromContractWithCustomerExcludingAssessedTax" in unified_df.columns:
-            unified_df["GrossProfit"] = unified_df["GrossProfit"].fillna(
-                unified_df["RevenueFromContractWithCustomerExcludingAssessedTax"] - unified_df.get("CostOfGoodsAndServicesSold", 0)
+        for idx, chunk in enumerate(symbol_chunks, 1):
+            print(
+                f"Downloading chunk {idx}/{len(symbol_chunks)} ({len(chunk)} tickers)..."
             )
+            success = False
+            max_retries = 3
 
-        # Keep metadata + core features (or retain all columns if preferred)
-        final_cols = ["Date", "Ticker"] + [
-            c for c in core_features if c in unified_df.columns
-        ]
-        normalized_df = unified_df[final_cols]
-        normalized_df.to_csv(AinySchema.DATA_DIR+'/financials.csv', index=False, header=True)
+            temp_dir = tempfile.gettempdir()
+            yf.set_tz_cache_location(temp_dir)
+            for attempt in range(1, max_retries + 1):
+                try:
+                    # Set a timeout on the request via threads/session parameters if needed
+                    df = yf.download(
+                        chunk,
+                        start=start_date,
+                        end=end_date,
+                        auto_adjust=True,
+                        progress=False,
+                        threads=False,
+                    )
+                    if not df.empty:
+                        all_dfs.append(df)
+                        success = True
+                        break
+                except Exception as e:
+                    print(
+                        f"Attempt {attempt} failed for chunk {idx}: {e}. Retrying..."
+                    )
+                    time.sleep(delay_seconds * attempt)
 
+            if not success:
+                print(f"Failed to download chunk {idx} after {max_retries} retries.")
 
-    def downloadBalancesheet(self, start_date, end_date):
-        raw_dfs = []
-        for symbol in self.symbols:
-            print("Downloading balancesheet for:",symbol)
-            ticker_obj = yf.Ticker(symbol)
+            time.sleep(delay_seconds)  # Cooldown between batches
 
-            # Fetch financial statements (columns are dates, index are line items)
-            fin = ticker_obj.get_balancesheet(freq="quarterly")
-            if fin is None or fin.empty:
-                continue
+        if not all_dfs:
+            return pd.DataFrame()
 
-            # Transpose so rows are dates and columns are financial line items
-            df = fin.T.reset_index().rename(columns={"index": "Date"})
-            df["Ticker"] = symbol
-            df["Date"] = pd.to_datetime(df["Date"])
-            df = df[
-                (df["Date"].dt.date >= start_date) & (df["Date"].dt.date <= end_date)
-            ]
-            raw_dfs.append(df)
-
-        if not raw_dfs:
-            return
-
-        # -------------------------------------------------------------
-        # Phase 1: Outer Union (Combines all unique columns across stocks)
-        # -------------------------------------------------------------
-        unified_df = pd.concat(raw_dfs, axis=0, ignore_index=True, join="outer")
-
-        # Sort deterministically
-        unified_df = unified_df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-
-        # Core standardized line items shared across most companies
-        core_features = [
-            "TotalAssets",
-            "CurrentAssets",
-            "CashCashEquivalentsAndShortTermInvestments",
-            "CashAndCashEquivalents",
-            "OtherShortTermInvestments",
-            "Receivables",
-            "AccountsReceivable",
-            "Inventory",
-            "NetPPE",  # Property, Plant & Equipment
-            "GrossPPE",
-            "GoodwillAndOtherIntangibleAssets",
-            "Goodwill",
-            "OtherIntangibleAssets",
-            "TotalLiabilitiesNetMinorityInterest",
-            "CurrentLiabilities",
-            "AccountsPayable",
-            "CurrentDebt",
-            "LongTermDebt",
-            "TotalDebt",  # CurrentDebt + LongTermDebt
-            "StockholdersEquity",
-            "StockholdersEquity",
-            "RetainedEarnings",
-            "WorkingCapital",
-        ]
-
-        # Ensure all core columns exist (add as NaN if completely missing from batch)
-        for col in core_features:
-            if col not in unified_df.columns:
-                unified_df[col] = np.nan
-
-        # Fill missing granular line items with 0
-        zero_fill_cols = [
-            "Goodwill",
-            "Receivables",
-            "Inventory",
-            "NetPPE",
-        ]
-        for col in zero_fill_cols:
-            if col in unified_df.columns:
-                unified_df[col] = unified_df[col].fillna(0)
-
-        # Calculate resilient fallback metrics if primary metrics are missing
-        if "TotalDebt" in unified_df.columns:
-            unified_df["TotalDebt"] = unified_df["TotalDebt"].fillna(
-                unified_df.get("CurrentDebt", 0.0) + unified_df.get("LongTermDebt", 0.0)
-            )
-
-        # Keep metadata + core features (or retain all columns if preferred)
-        final_cols = ["Date", "Ticker"] + [
-            c for c in core_features if c in unified_df.columns
-        ]
-        normalized_df = unified_df[final_cols].copy()
-        normalized_df.to_csv(AinySchema.DATA_DIR+'/balancesheet.csv', index=False, header=True)
-
-
-    def downloadCashflow(self, start_date, end_date):
-        raw_dfs = []
-        for symbol in self.symbols:
-            print("Downloading cashflow for:",symbol)
-            ticker_obj = yf.Ticker(symbol)
-
-            # Fetch financial statements (columns are dates, index are line items)
-            fin = ticker_obj.get_cashflow(freq="quarterly")
-            if fin is None or fin.empty:
-                continue
-
-            # Transpose so rows are dates and columns are financial line items
-            df = fin.T.reset_index().rename(columns={"index": "Date"})
-            df["Ticker"] = symbol
-            df["Date"] = pd.to_datetime(df["Date"])
-            df = df[
-                (df["Date"].dt.date >= start_date) & (df["Date"].dt.date <= end_date)
-            ]
-            raw_dfs.append(df)
-
-        if not raw_dfs:
-            return
-
-        # -------------------------------------------------------------
-        # Phase 1: Outer Union (Combines all unique columns across stocks)
-        # -------------------------------------------------------------
-        unified_df = pd.concat(raw_dfs, axis=0, ignore_index=True, join="outer")
-
-        # Sort deterministically
-        unified_df = unified_df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-
-        # Core standardized line items shared across most companies
-        core_features = [
-            "NetCashProvidedByUsedInOperatingActivities",
-            "InvestingCashFlow",
-            "FinancingCashFlow",
-            "PaymentsToAcquirePropertyPlantAndEquipment",
-            "FreeCashFlow",  # NetCashProvidedByUsedInOperatingActivities - PaymentsToAcquirePropertyPlantAndEquipment
-            "StockBasedCompensation",
-            "DepreciationAndAmortization",
-            "RepurchaseOfCapitalStock",
-            "CommonStockDividendPaid",
-            "ChangeInWorkingCapital",
-            "NetIssuancePaymentsOfDebt",
-        ]
-
-        # Ensure all core columns exist (add as NaN if completely missing from batch)
-        for col in core_features:
-            if col not in unified_df.columns:
-                unified_df[col] = np.nan
-
-        # Fill missing granular line items with 0
-        zero_fill_cols = [
-            "StockBasedCompensation",
-            "CommonStockDividendPaid",
-            "RepurchaseOfCapitalStock",
-        ]
-        for col in zero_fill_cols:
-            if col in unified_df.columns:
-                unified_df[col] = unified_df[col].fillna(0)
-
-        # Calculate resilient fallback metrics if primary metrics are missing
-        if "FreeCashFlow" in unified_df.columns:
-            unified_df["FreeCashFlow"] = unified_df["FreeCashFlow"].fillna(
-                unified_df.get("NetCashProvidedByUsedInOperatingActivities", 0.0)
-                - np.abs(unified_df.get("PaymentsToAcquirePropertyPlantAndEquipment", 0.0))
-            )
-
-        # Keep metadata + core features (or retain all columns if preferred)
-        final_cols = ["Date", "Ticker"] + [
-            c for c in core_features if c in unified_df.columns
-        ]
-        normalized_df = unified_df[final_cols].copy()
-        normalized_df.to_csv(AinySchema.DATA_DIR+'/cashflow.csv', index=False, header=True)
-
-
-    def downloadMisc(self, start_date, end_date):
-        write_header = True
-        mode = "w"
-        for symbol in self.symbols:
-            ticker_obj = yf.Ticker(symbol)
-            print("Downloading metrics data for:",symbol)
-
-            actions = ticker_obj.get_actions(period="max").reset_index().rename(columns={'index': 'Date'})
-            actions['Ticker'] = symbol
-            actions['Date'] = pd.to_datetime(actions['Date']).dt.date
-            # Filter: start <= Date <= end
-            actions = actions[
-                (actions["Date"] >= start_date) & (actions["Date"] <= end_date)
-            ]
-            actions.to_csv(AinySchema.DATA_DIR+'/actions.csv', mode=mode, index=False, header=write_header)
-
-            price_targets = pd.DataFrame([ticker_obj.get_analyst_price_targets()])
-            price_targets['Ticker'] = symbol
-            price_targets['Date'] = datetime.now(timezone.utc).date()
-            price_targets.to_csv(AinySchema.DATA_DIR+'/price_targets.csv',mode=mode, index=False, header=write_header)
-
-            write_header = False
-            mode = "a"
-
-
-    def transformFeatureXY(self, X: pd.DataFrame, symbol: str) -> pd.DataFrame:
-        df_transformed = X.T
-        # 1. Convert date headers from the index into a dedicated 'Date' column
-        df_transformed = df_transformed.reset_index().rename(columns={'index': 'Date'})
-        # 2. Ensure Date is datetime type
-        df_transformed['Date'] = pd.to_datetime(df_transformed['Date'])
-        df_transformed['Ticker'] = symbol
-        return df_transformed
+        # Combine chunk DataFrames along columns
+        combined_df = pd.concat(all_dfs, axis=1)
+        return combined_df
 
 
     def load(self):
         # 1. Load the price data
         price_df = pd.read_csv(AinySchema.DATA_DIR+'/price.csv')
         price_df["Date"] = pd.to_datetime(price_df["Date"])
-        price_df["TargetDate"] = pd.to_datetime(price_df["TargetDate"])
+        price_df["TargetDate"] = price_df["Date"] + pd.to_timedelta(self.look_ahead_days, unit='D')
         #print("price_df:\n",price_df)
 
         #2 Self-merge to find the nearest price on the target date for each stock
         price_target_df = pd.merge_asof(
-            price_df.sort_values('TargetDate'),
-            price_df[['Ticker', 'Date', 'Close']].sort_values('Date'),
-            by='Ticker',
-            left_on='TargetDate',
-            right_on='Date',
-            direction='nearest',
-            suffixes=('', '_Target'))
+            price_df.sort_values(["TargetDate"]),
+            price_df[["Ticker", "Date", "Close"]].sort_values(["Date"]),
+            by="Ticker",
+            left_on="TargetDate",
+            right_on="Date",
+            direction="forward",
+            tolerance=pd.Timedelta(days=3),
+            suffixes=("", "_Target")
+        )
 
-        price_target_df['Pct_Diff'] = ((price_target_df['Close_Target'] - price_target_df['Close']) / price_target_df['Close']) * 100
+        #Filter out records where TargetDate is in the future
+        today = pd.Timestamp.today().normalize()
+        price_target_df = price_target_df[price_target_df["Date_Target"] <= today].copy()
+
+        price_target_df['Pct_Diff'] = (price_target_df['Close_Target']/price_target_df['Close'] - 1) * 100
         #print("price_target_df:",price_target_df['Pct_Diff'])
         price_target_df.dropna(subset=['Pct_Diff'],inplace=True)
 
-        hold_threshold = 10.0  # Adjust this percentage based on your desired 'small' range
-        bins = [-np.inf, 0, hold_threshold, np.inf]
+        hold_threshold = 3.0
+        bins = [-np.inf, -hold_threshold, hold_threshold, np.inf]
         # 1:Sell, 2: Hold, 3: Buy
         labels = [1, 2, 3]
         price_target_df['bhsScore'] = pd.cut(price_target_df['Pct_Diff'], bins=bins, labels=labels, include_lowest=True).astype(int)
@@ -430,7 +233,7 @@ class FeatureExtractor:
 def main():
     print(f"=== Starting Feature Extraction : {datetime.now(ZoneInfo('America/New_York')).date()} ===")
     featureExtractor = FeatureExtractor("BHS")
-    featureExtractor.download();
+    featureExtractor.download()
     if featureExtractor.status == 'Done':
         print("=== Feature Download Completed Successfully ===")
         featureExtractor.load();

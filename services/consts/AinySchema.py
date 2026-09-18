@@ -4,7 +4,7 @@ from typing import ClassVar
 
 @dataclass(frozen=True)
 class AinySchema:
-    DATA_DIR: str = str(Path(__file__).resolve().parent.parent/"data")
+    DATA_DIR: str = str(Path(__file__).resolve().parent.parent.parent/"data")
     DATE: str = "Date"
     TICKER: str = "Ticker"
     REVENUE: str = "RevenueFromContractWithCustomerExcludingAssessedTax"

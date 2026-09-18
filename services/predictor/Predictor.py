@@ -8,9 +8,10 @@ import shap
 import yfinance as yf
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
+from typing import Optional
 
 from services.consts.AinySchema import AinySchema
-from services.model_builder.ModelBuilder import ModelBuilder
+from services.model_builder.ModelBuilder_GPT import ModelBuilder
 
 BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "anypug.appspot.com")
 DIRECTORY_NAME = "ainyfin/models"
@@ -25,11 +26,15 @@ class Predictor:
     def __init__(self, builder: str, n_estimators: int = 100):
         self.target_column = "bhsScore"
 
-    def init_runtime(self):
+    def init_runtime(self, modelBuilder:ModelBuilder):
+        """
         local_path = f"/tmp/{XGBMODEL_FILENAME}"
         print("Loading Model:",  local_path)
         self.xg_model = joblib.load(local_path)
-        print("Model running:",  self.xg_model)
+        """
+
+        self.xg_model = modelBuilder.load_model()
+        print("Model Running:",  self.xg_model)
 
         # 1. Get raw normalized importance scores
         importances = self.xg_model.feature_importances_
@@ -40,85 +45,64 @@ class Predictor:
             'Importance': importances
         }).sort_values(by='Importance', ascending=False)
 
-        #print(feature_imp_df)
+        print(feature_imp_df)
 
 
-
-    def create_input(self, tickers):
-        #1 get current price
-        price_df = yf.download(tickers, period="1d", progress=False)
-        if not price_df.empty:
+    def create_input(self, modelBuilder:ModelBuilder, tickers):
+        # 1. Fetch Current Live Market Prices
+        new_price_df = yf.download(tickers, period="7d", progress=False)
+        if not new_price_df.empty:
             # Drop columns where all values are NaN (failed tickers)
-            price_df = price_df.dropna(how="all", axis=1)
-            price_df = price_df.stack(level=1, future_stack=True).reset_index()
+            new_price_df = new_price_df.dropna(how="all", axis=1)
+            new_price_df = new_price_df.stack(level=1, future_stack=True).reset_index()
         else:
             print("No price data found for tickers:", tickers)
-            return pd.DataFrame()  # Return an empty DataFrame if no data is found
+            return pd.DataFrame()
+
+        old_price_df = pd.read_csv(AinySchema.DATA_DIR + "/price.csv")
+        old_price_df = old_price_df[old_price_df["Ticker"].isin(tickers)].copy()
+        old_price_df['Date'] = pd.to_datetime(old_price_df['Date'])
+        latest_date = old_price_df['Date'].max()
+        latest_year_df = old_price_df[old_price_df['Date'] >= (latest_date - pd.Timedelta(days=365))]
+        price_df = pd.concat([new_price_df,latest_year_df])
 
         print("price_df tickers:", price_df['Ticker'].unique().tolist())
-
         price_df["Date"] = pd.to_datetime(price_df["Date"]).astype("datetime64[ns]")
-        #print("price_df:\n", price_df)
-
-        #need to filter by tickers
-        financial_df = pd.read_csv(AinySchema.DATA_DIR+'/financial_data.csv')
-        financial_df = financial_df[financial_df['Ticker'].isin(price_df['Ticker'])]
-        if financial_df.empty:
-            print("No financial data found for tickers:", price_df['Ticker'].unique().tolist())
-            return pd.DataFrame()  # Return an empty DataFrame if no data is found
-
-        financial_df["Date"] = pd.to_datetime(financial_df["Date"]).astype("datetime64[ns]")
-        #print("financial_df:\n", financial_df)
-
         price_df = price_df.sort_values("Date").reset_index(drop=True)
-        financial_df = financial_df.sort_values("Date").reset_index(drop=True)
 
-        # 2. Merge historical data and fundamental info together
-        merged_df = pd.merge_asof(price_df, financial_df, left_on='Date',  right_on='Date',
-                                  by='Ticker',    direction='backward')
+        # 2. Load Full Historical Financial Dataset
+        full_financial_df = pd.read_csv(AinySchema.DATA_DIR + "/financial_data.csv")
+        full_financial_df["Date"] = pd.to_datetime(full_financial_df["Date"]).astype("datetime64[ns]")
 
-        #print("metrics_df after price:\n",  merged_df)
+        # Filter for target tickers
+        if full_financial_df["Ticker"].isin(price_df["Ticker"]).empty:
+            print("No financial data found for tickers:", price_df["Ticker"].tolist())
+            return pd.DataFrame()
 
-        zero_fill_cols = [
-            "ResearchAndDevelopment",
-            "InterestExpense",
-            "InterestIncome",
-            "TotalUnusualItems",
-            "Goodwill",
-            "Receivables",
-            "Inventory",
-            "NetPPE",
-            "StockBasedCompensation",
-            "CommonStockDividendPaid",
-            "RepurchaseOfCapitalStock",
-        ]
+        full_financial_df.to_csv(AinySchema.DATA_DIR + "/full_financial_df.csv")
+        merged_df = modelBuilder.build_features(price_df, financial_data=full_financial_df)
 
-        existing_cols = [c for c in zero_fill_cols if c in merged_df.columns]
-        if existing_cols:
-            merged_df[existing_cols] = merged_df[existing_cols].fillna(0)
+        if merged_df.empty or merged_df["Close"].isna().all():
+            print("No matching financial data found for target tickers.")
+            return pd.DataFrame()
 
-        missing_cols = [c for c in zero_fill_cols if c not in merged_df.columns]
-        if missing_cols:
-            missing_df = pd.DataFrame(0, index=merged_df.index, columns=missing_cols, dtype=float)
-            merged_df = pd.concat([merged_df, missing_df], axis=1)
+        #print("merged_df:", merged_df.columns.tolist())
+        expected_features =  self.xg_model.get_booster().feature_names
+        print("expected_features:", expected_features)
+        missing_columns = [col for col in expected_features if col not in merged_df.columns]
+        print("Missing columns:", missing_columns)
+        if len(missing_columns) > 0:
+            print("Warning: Some expected training columns are missing in the final merged DataFrame.")
+            return pd.DataFrame()  # Return an empty DataFrame if critical columns are missing
 
-        modelBuilder = ModelBuilder("xg",100)
-        snapshot_df = modelBuilder.compute_financial_snapshot(merged_df)
-        snapshot_df = snapshot_df.sort_values(['Date']).reset_index(drop=True)
-        #print("metrics_df after compute_financial_snapshot:\n",  snapshot_df)
+        merged_df['Date'] = pd.to_datetime(merged_df['Date'])
+        largest_date_rows:pd.DataFrame = merged_df[merged_df['Date'] == merged_df['Date'].max()]
 
-        financial_trends_df = modelBuilder.compute_financial_trends(financial_df)
-        financial_trends_df = financial_trends_df.sort_values(['Date']).reset_index(drop=True)
-
-        merged_df = pd.merge_asof(snapshot_df, financial_trends_df, left_on='Date', right_on='Date',
-                                  by='Ticker', direction='backward', suffixes=('', '_Trends'))
-
-        merged_df.fillna(0, inplace=True)
-        input_columns = [col for col in modelBuilder.training_columns if col != "bhsScore"]
-        merged_df[input_columns + ['Ticker']].to_csv(AinySchema.DATA_DIR+'/testdata.csv')
-        print("create_input final-df:\n",  input_columns + ['Ticker'])
-        print("create_input final-df:\n",  merged_df[input_columns + ['Ticker']])
-        return merged_df[input_columns + ['Ticker']]
+        # Save artifact for debugging
+        final_df = largest_date_rows[expected_features + ["Ticker"]].reset_index(drop=True)
+        final_df.to_csv(AinySchema.DATA_DIR + "/testdata.csv", index=False)
+        print("Final input data generated successfully:\n", final_df)
+        return final_df
 
 
     def predict(self, tickerlist, input_df):
@@ -128,7 +112,7 @@ class Predictor:
         ticker_bhs_map = dict(zip(tickerlist, out_pred_desc))
         print(f"BHS Predictions: {ticker_bhs_map}")
 
-        # Or print line-by-line
+        #Or print line-by-line
         #for ticker, desc in zip(tickerlist, bhs_desc):
         #  print(f"{ticker}: {desc}")
         return ticker_bhs_map
@@ -142,7 +126,8 @@ class Predictor:
         min_confidence: float = 0.40,
         min_margin: float = 0.05,
     ) -> dict:
-        """Predicts BHS signals, applies conviction filtering, and extracts SHAP drivers.
+        """
+        Predicts BHS signals, applies conviction filtering, and extracts SHAP drivers.
 
         Parameters:
         -----------
@@ -162,11 +147,9 @@ class Predictor:
         dict
             Structured output containing filtered actions, confidence, margin, and SHAP drivers.
         """
+
         # 1. Align features
-        modelBuilder = ModelBuilder("xg", 100)
-        input_columns = [
-            col for col in modelBuilder.training_columns if col != "bhsScore"
-        ]
+        input_columns =  self.xg_model.get_booster().feature_names
         X = df[input_columns].copy()
 
         # 2. Inference
@@ -205,7 +188,7 @@ class Predictor:
                 actionable_signal = raw_signal
                 status = "ACTIONABLE"
             else:
-                actionable_signal = "NO_TRADE (Hold Cash)"
+                actionable_signal = "NO_TRADE(Hold)"
                 status = "FILTERED (Low Conviction)"
 
             # Extract SHAP array for raw predicted class
@@ -256,10 +239,12 @@ def main(args:list):
         return
 
     predictor = Predictor("xg",100)
+    modelBuilder = ModelBuilder("xg")
+    predictor.init_runtime(modelBuilder)
+
     tickerlist:list[str] = [ticker.strip() for ticker in args[0].split(",")]
-    input_df = predictor.create_input(tickerlist)
+    input_df = predictor.create_input(modelBuilder, tickerlist)
     if input_df.empty == False:
-        predictor.init_runtime()
         valid_tickers = input_df['Ticker'].tolist()
         #results = predictor.predict(valid_tickers, input_df)
         results = predictor.predict_with_explanations(valid_tickers, input_df)
