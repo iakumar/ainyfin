@@ -18,6 +18,14 @@ class FeatureExtractor:
         self.look_ahead_days = 30
 
         self.symbols: list[str] = [
+            'AAPL', 'AMD', 'AMZN', 'ABNB', 'CBRE', 'CMCSA', 'CRWD', 'DAL', 'DUK', 'EOG',
+            'ETN', 'GE', 'GEV', 'GOOG', 'GOOGL', 'GRMN', 'GS', 'HOOD', 'ICE', 'INTU',
+            'IQV', 'IR', 'JNJ', 'JPM', 'KO', 'LRCX', 'LYB', 'MANH', 'MDLZ', 'META',
+            'MRK', 'MSFT', 'NET', 'NFLX', 'NVDA', 'PANW', 'PG', 'PLTR', 'PSX', 'RH',
+            'SNOW', 'SO', 'T', 'TMO', 'TSLA', 'TT', 'TROW', 'V', 'WFC', 'WMT',
+            'XOM', 'XYZ', 'Z']
+
+        self.symbols2: list[str] = [
             # --- Original List ---
             'AAPL', 'AMD', 'AMZN', 'ABNB', 'CBRE', 'CMCSA', 'CRWD', 'DAL', 'DUK', 'EOG',
             'ETN', 'GE', 'GEV', 'GOOG', 'GOOGL', 'GRMN', 'GS', 'HOOD', 'ICE', 'INTU',

@@ -8,11 +8,16 @@ import numpy as np
 import pandas as pd
 import requests
 from pandas.tseries.holiday import USFederalHolidayCalendar
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+)
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
-from sklearn.metrics import classification_report, confusion_matrix
+
 from services.consts.AinySchema import AinySchema
 
 BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "anypug.appspot.com")

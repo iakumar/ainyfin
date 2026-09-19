@@ -163,8 +163,7 @@ class EdgarXDI:
                 "RestructuringCosts",
                 "RevenueFromContractWithCustomerIncludingAssessedTax",
                 "SalesTypeLeaseSellingProfitLoss"
-                "SharebasedCompensationArrangementBySharebasedPaymentAwardCompensationCost1"
-            ]
+                "SharebasedCompensationArrangementBySharebasedPaymentAwardCompensationCost1"            ]
             df3 = df3.drop(columns=[c for c in cf_dups if c in df3.columns])
 
             #print("cash_flow_statement df:\n",df3.columns)

@@ -6,12 +6,9 @@ import numpy as np
 import pandas as pd
 import shap
 import yfinance as yf
-from sklearn.preprocessing import LabelEncoder
-from xgboost import XGBClassifier
-from typing import Optional
 
 from services.consts.AinySchema import AinySchema
-from services.model_builder.ModelBuilder_GPT import ModelBuilder
+from services.model_builder.ModelBuilder_CL import ModelBuilder
 
 BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "anypug.appspot.com")
 DIRECTORY_NAME = "ainyfin/models"

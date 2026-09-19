@@ -356,7 +356,6 @@ class ModelBuilder:
             "Momentum_12M_1M",
 
             "Price_Vs_52W_High",
-
         ]
 
         # -------------------------------------------------------------
@@ -417,8 +416,6 @@ class ModelBuilder:
             "EV_To_EBITDA",
             "EV_To_EBIT",
 
-            "FCF_Margin",
-
             "Asset_Turnover",
 
             "Cash_Conversion_Cycle",
@@ -434,17 +431,17 @@ class ModelBuilder:
             "Reinvestment_Rate",
 
             "Buyback_Yield",
-
             "Dividend_Yield",
 
             "Intangibles_Plus_Goodwill_To_Assets",
 
             "Deferred_Revenue_To_Revenue",
-
         ]
 
+        sector_columns = [col+'_SectorZ' for col in self.sector_base_columns]
+
         # Remove accidental duplicates while preserving order.
-        self.available_training_columns = list(dict.fromkeys(self.snapshot_columns + self.trend_columns))
+        self.available_training_columns = list(dict.fromkeys(self.snapshot_columns + self.trend_columns + sector_columns))
 
         self.model:XGBClassifier = None
 
@@ -736,7 +733,7 @@ class ModelBuilder:
             if column in [
                 self.config.ticker_column,
                 self.config.date_column,
-                "Sector",
+                "SIC",
             ]:
                 continue
 
@@ -1952,25 +1949,21 @@ class ModelBuilder:
     ) -> pd.DataFrame:
         """
         Add sector-relative versions of selected features.
-
         Requires:
-            Sector
+            SIC (or broader sector column)
 
-        If Sector is not available, this method simply returns data.
-
+        If required columns are not available, this method simply returns data.
         The normalization is cross-sectional by Date + Sector.
         """
-
         data = data.copy()
 
-        if "Sector" not in data.columns:
+        if "SIC" not in data.columns:
             return data
 
         if self.config.date_column not in data.columns:
             return data
 
         for column in self.sector_base_columns:
-
             if column not in data.columns:
                 continue
 
@@ -1979,24 +1972,25 @@ class ModelBuilder:
             grouped = data.groupby(
                 [
                     self.config.date_column,
-                    "Sector",
+                    "SIC",
                 ],
                 observed=True,
             )[column]
 
+            # Calculate mean and standard deviation
             mean = grouped.transform("mean")
-            std = grouped.transform("std")
+            # std returns NaN for N=1 groups; fill with 0 to track singletons/zero-variance
+            std = grouped.transform("std").fillna(0)
 
-            data[output] = (
-                (data[column] - mean)
-                /
-                std.replace(0, np.nan)
-            )
+            # Standard Z-Score formulation
+            # If std == 0 (single stock or identical values), (x - mean) is 0, so output is 0.0
+            z_score = np.where(std == 0, 0.0, (data[column] - mean) / std)
 
-            data[output] = data[output].clip(
-                -5,
-                5,
-            )
+            # Fill any remaining NaNs (e.g., where the underlying source column was NaN) with 0.0
+            data[output] = pd.Series(z_score, index=data.index).fillna(0.0)
+
+            # Clip extreme outliers
+            data[output] = data[output].clip(-5, 5)
 
         return data
 
@@ -2278,6 +2272,46 @@ class ModelBuilder:
         #
         # This is deliberately NOT a simple merge on quarter-end Date.
         # -------------------------------------------------------------
+        # ---------------------------------------------------------------
+        # BUGFIX (combine_first upgrade): the original fix here dropped
+        # the price side's duplicate fundamental columns entirely before
+        # merging, on the assumption that financial_data.csv (documented
+        # as authoritative) would be at least as complete. Checked
+        # against the real files and that assumption doesn't hold for
+        # every field: ainyfin_data.csv's pre-baked "previous quarter"
+        # join is sometimes MORE complete than financial_data.csv's fresh
+        # table for the same field -- e.g. shares outstanding is 31.0%
+        # null in ainyfin_data.csv vs. 42.5% null in financial_data.csv;
+        # net income is 7.5% null vs. 22.4% null. Dropping ainyfin_data's
+        # columns outright was fixing the collision but leaving real,
+        # already-available coverage on the table.
+        #
+        # Rather than drop, rename the price side's copies with a
+        # temporary suffix (so they no longer collide with
+        # financial_data.csv's exact names -- the original bug), merge,
+        # then for each overlapping field prefer financial_data.csv's
+        # value and fall back to ainyfin_data.csv's baked-in value only
+        # where financial_data.csv is null. financial_data.csv still
+        # wins whenever it has data, since it's the documented
+        # authoritative/fresher source -- this only recovers coverage
+        # for rows financial_data.csv doesn't have at all.
+        STALE_SUFFIX = "__ainyfin_baked_in"
+
+        fundamental_overlap_cols = [
+            c for c in price_data.columns
+            if c in set(fundamentals.columns) and c not in (
+                self.config.ticker_column,
+                self.config.date_column,
+            )
+        ]
+        if fundamental_overlap_cols:
+            price_data = price_data.rename(
+                columns={
+                    c: f"{c}{STALE_SUFFIX}"
+                    for c in fundamental_overlap_cols
+                }
+            )
+
         left = price_data.sort_values([self.config.date_column])
         right = fundamentals.sort_values([self.config.date_column])
 
@@ -2290,26 +2324,37 @@ class ModelBuilder:
             direction="backward",
             allow_exact_matches=True,
         )
-        #print("Merged data:\n", data)
+
+        # Fill gaps in financial_data.csv's columns from ainyfin_data's
+        # baked-in values, then drop the temporary suffixed columns.
+        for c in fundamental_overlap_cols:
+            baked_in_col = f"{c}{STALE_SUFFIX}"
+            if baked_in_col in data.columns:
+                if c in data.columns:
+                    data[c] = data[c].combine_first(data[baked_in_col])
+                else:
+                    data[c] = data[baked_in_col]
+                data = data.drop(columns=[baked_in_col])
+
+        data.to_csv(f"{AinySchema.DATA_DIR}/build_features.csv", index=False)
 
         # -------------------------------------------------------------
         # Market features
         # -------------------------------------------------------------
         data = self.compute_market_features(data)
-        data.to_csv(f"{AinySchema.DATA_DIR}/merged_data_with_market_features.csv", index=False)
-        #print("compute_market_features data:\n", data)
+        data.to_csv(f"{AinySchema.DATA_DIR}/compute_market_features.csv", index=False)
 
         # -------------------------------------------------------------
         # Price-dependent valuation features
         # -------------------------------------------------------------
         data = self.compute_valuation_features(data)
-        print("compute_valuation_features data:\n", data)
+        data.to_csv(f"{AinySchema.DATA_DIR}/compute_valuation_features.csv", index=False)
 
         # -------------------------------------------------------------
         # Sector-relative features
         # -------------------------------------------------------------
         data = self.add_sector_zscores(data)
-        print("add_sector_zscores data:\n", data)
+        data.to_csv(f"{AinySchema.DATA_DIR}/add_sector_zscores.csv", index=False)
 
         return data
 
@@ -2549,13 +2594,6 @@ class ModelBuilder:
                     fcf,
                 )
 
-        print("market_cap:\n", market_cap)
-        print("operating_income:\n", operating_income)
-        print("net_income:\n", net_income)
-        print("ebitda:\n", ebitda)
-        print("debt:\n",debt)
-        print("revenue:\n",revenue)
-
         if market_cap is not None and ebitda is not None:
             if debt is not None:
                 net_debt = (
@@ -2606,7 +2644,9 @@ class ModelBuilder:
         else:
             market_cap = pd.to_numeric(market_cap, errors="coerce").fillna(0.0)
 
-        data["Buyback_Yield"] = buybacks.abs() / market_cap.abs()
+        data["Buyback_Yield"] = self._safe_divide(
+            buybacks.abs(), market_cap.abs()
+        )
 
         dividends = self._first_existing(
             data,
@@ -2623,7 +2663,9 @@ class ModelBuilder:
             dividends = pd.to_numeric(dividends, errors="coerce").fillna(0.0)
 
         # Take absolute value as cash flow items are sometimes reported as negative numbers
-        data["Dividend_Yield"] = dividends.abs() / market_cap.abs()
+        data["Dividend_Yield"] = self._safe_divide(
+            dividends.abs(), market_cap.abs()
+        )
         return data
 
     # =================================================================
@@ -2671,7 +2713,7 @@ class ModelBuilder:
             "SG&A": ["SellingGeneralAndAdministrativeExpense"],
             "Goodwill": ["Goodwill"],
             "Intangibles": ["IntangibleAssetsNetExcludingGoodwill"],
-            "Sector": ["SIC"],
+            "SIC": ["SIC"],
             "FilingDate": [
                 "FilingDate", "filing_date", "FiledDate", "acceptedDate",
                 "AcceptedDate", "SEC_Filing_Date", "Date",
@@ -3578,7 +3620,10 @@ class ModelBuilder:
         model = model or self.model
 
         if model is None:
-            raise ValueError("No trained model available.")
+
+            raise ValueError(
+                "No trained model available."
+            )
 
         importance = (model.feature_importances_)
 
@@ -3600,9 +3645,14 @@ class ModelBuilder:
 
         self.feature_importance = result
 
-        print("\n" + "=" * 70)
+        print(
+            "\n"
+            + "=" * 70
+        )
 
-        print("=== Global Feature Importance ===")
+        print(
+            "=== Global Feature Importance ==="
+        )
 
         print(
             result.to_string(
