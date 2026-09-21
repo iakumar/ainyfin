@@ -115,7 +115,7 @@ class FeatureExtractor:
             return pd.DataFrame()
 
         price_df = price_df.sort_values('Date').reset_index(drop=True)
-        price_df.to_csv(AinySchema.DATA_DIR+'/price.csv')
+        price_df.to_csv(AinySchema.DATA_DIR+'price.csv')
 
         edgarXDI = EdgarXDI("BHS")
         edgarXDI.downloadFinancialData(self.symbols)
@@ -174,7 +174,7 @@ class FeatureExtractor:
 
     def load(self):
         # 1. Load the price data
-        price_df = pd.read_csv(AinySchema.DATA_DIR+'/price.csv')
+        price_df = pd.read_csv(AinySchema.DATA_DIR+'price.csv')
         price_df["Date"] = pd.to_datetime(price_df["Date"])
         price_df["TargetDate"] = price_df["Date"] + pd.to_timedelta(self.look_ahead_days, unit='D')
         #print("price_df:\n",price_df)
@@ -205,36 +205,12 @@ class FeatureExtractor:
         labels = [1, 2, 3]
         price_target_df['bhsScore'] = pd.cut(price_target_df['Pct_Diff'], bins=bins, labels=labels, include_lowest=True).astype(int)
 
-        # 3. Clean up the temporary column if needed
-        price_target_df.drop(columns=['Unnamed: 0'],inplace=True)
-        print("price_target_df:\n",price_target_df)
-
-        # 4. current P/E and other metrics
-        """
-        financials_df = pd.read_csv(AinySchema.DATA_DIR+'/financials.csv')
-        balancesheet = pd.read_csv(AinySchema.DATA_DIR+'/balancesheet.csv')
-        metrics_df = pd.merge(financials_df, balancesheet, on=['Ticker','Date'], how='inner')
-        cashflow = pd.read_csv(AinySchema.DATA_DIR+'/cashflow.csv')
-        metrics_df = pd.merge(metrics_df, cashflow, on=['Ticker','Date'], how='inner')
-        """
-
-        # 5. Both DataFrames MUST be sorted chronologically by date
-        metrics_df = pd.read_csv(AinySchema.DATA_DIR+'/financial_data.csv')
-        metrics_df['Date'] = pd.to_datetime(metrics_df['Date'])
-        metrics_df = metrics_df.sort_values('Date').reset_index(drop=True)
-        print("metrics_df:\n", metrics_df)
-
+        # 2. Clean up the temporary column
+        price_target_df.drop(columns=['Unnamed: 0','Date_Target'],inplace=True)
         price_target_df['Date'] = pd.to_datetime(price_target_df['Date'])
         price_target_df = price_target_df.sort_values('Date').reset_index(drop=True)
-
-        # 6. Merge historical data and fundamental info together
-        merged_df = pd.merge_asof(price_target_df, metrics_df, left_on='Date',  right_on='Date',
-                                  by='Ticker',    direction='backward')    # Uses last available fundamental data (no look-ahead leakage)
-
-        #merged_df.fillna(0, inplace=True)
-        #print(merged_df[merged_df['Ticker'] == 'ICE'][['Ticker', 'Date', 'Close', 'TargetDate', 'Close_Target', 'TaxRateForCalcs']].head(25))
-        merged_df.to_csv(AinySchema.DATA_DIR+'/ainyfin_data.csv')
-
+        print("price_target_df:\n",price_target_df)
+        price_target_df.to_csv(AinySchema.DATA_DIR+'ainyfin_data.csv')
         self.status = 'Done'
 
 

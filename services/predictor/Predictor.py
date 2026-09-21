@@ -47,7 +47,7 @@ class Predictor:
 
     def create_input(self, modelBuilder:ModelBuilder, tickers):
         # 1. Fetch Current Live Market Prices
-        new_price_df = yf.download(tickers, period="7d", progress=False)
+        new_price_df = yf.download(tickers, period="3d", progress=False)
         if not new_price_df.empty:
             # Drop columns where all values are NaN (failed tickers)
             new_price_df = new_price_df.dropna(how="all", axis=1)
@@ -56,19 +56,25 @@ class Predictor:
             print("No price data found for tickers:", tickers)
             return pd.DataFrame()
 
-        old_price_df = pd.read_csv(AinySchema.DATA_DIR + "/price.csv")
-        old_price_df = old_price_df[old_price_df["Ticker"].isin(tickers)].copy()
+        ticker_sic_df = pd.read_csv(AinySchema.DATA_DIR + "ticker_sic.csv")
+        new_price_df = new_price_df.merge(ticker_sic_df[["Ticker", "SIC"]], on="Ticker", how="left")
+
+        old_price_df = pd.read_csv(AinySchema.DATA_DIR + "ainyfin_data.csv")
+        old_price_df = old_price_df.merge(ticker_sic_df[["Ticker", "SIC"]], on="Ticker", how="left")
+        sic_list = old_price_df["SIC"].unique().tolist()
+        #load old prices within the sectors (SIC)
+        old_price_df = old_price_df[old_price_df["SIC"].isin(sic_list)].copy()
         old_price_df['Date'] = pd.to_datetime(old_price_df['Date'])
         latest_date = old_price_df['Date'].max()
         latest_year_df = old_price_df[old_price_df['Date'] >= (latest_date - pd.Timedelta(days=365))]
         price_df = pd.concat([new_price_df,latest_year_df])
 
-        print("price_df tickers:", price_df['Ticker'].unique().tolist())
+        #print("price_df tickers:", price_df['Ticker'].unique().tolist())
         price_df["Date"] = pd.to_datetime(price_df["Date"]).astype("datetime64[ns]")
         price_df = price_df.sort_values("Date").reset_index(drop=True)
 
         # 2. Load Full Historical Financial Dataset
-        full_financial_df = pd.read_csv(AinySchema.DATA_DIR + "/financial_data.csv")
+        full_financial_df = pd.read_csv(AinySchema.DATA_DIR + "financial_data.csv")
         full_financial_df["Date"] = pd.to_datetime(full_financial_df["Date"]).astype("datetime64[ns]")
 
         # Filter for target tickers
@@ -76,7 +82,6 @@ class Predictor:
             print("No financial data found for tickers:", price_df["Ticker"].tolist())
             return pd.DataFrame()
 
-        full_financial_df.to_csv(AinySchema.DATA_DIR + "/full_financial_df.csv")
         merged_df = modelBuilder.build_features(price_df, financial_data=full_financial_df)
 
         if merged_df.empty or merged_df["Close"].isna().all():
@@ -94,10 +99,11 @@ class Predictor:
 
         merged_df['Date'] = pd.to_datetime(merged_df['Date'])
         largest_date_rows:pd.DataFrame = merged_df[merged_df['Date'] == merged_df['Date'].max()]
+        largest_date_rows = largest_date_rows[largest_date_rows["Ticker"].isin(tickers)].copy()
 
         # Save artifact for debugging
         final_df = largest_date_rows[expected_features + ["Ticker"]].reset_index(drop=True)
-        final_df.to_csv(AinySchema.DATA_DIR + "/testdata.csv", index=False)
+        final_df.to_csv(AinySchema.DATA_DIR + "testdata.csv", index=False)
         print("Final input data generated successfully:\n", final_df)
         return final_df
 

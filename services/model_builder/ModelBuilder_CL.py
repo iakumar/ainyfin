@@ -51,6 +51,7 @@ from sklearn.metrics import (
     f1_score,
 )
 
+from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 from services.consts.AinySchema import AinySchema
 
@@ -69,10 +70,10 @@ class ModelConfig:
     # -----------------------------------------------------------------
 
     # ainyfin_data.csv is the daily price/target source.
-    training_file: str = f"{AinySchema.DATA_DIR}/ainyfin_data.csv"
+    training_file: str = f"{AinySchema.DATA_DIR}ainyfin_data.csv"
 
     # financial_data.csv is the authoritative SEC fundamental source.
-    financial_file: str = f"{AinySchema.DATA_DIR}/financial_data.csv"
+    financial_file: str = f"{AinySchema.DATA_DIR}financial_data.csv"
 
     model_file: str = "models/ainyfin_xgb_model.json"
 
@@ -109,7 +110,7 @@ class ModelConfig:
     n_walk_forward_folds: int = 5
 
     # Minimum training observations.
-    min_train_rows: int = 50000
+    min_train_rows: int = 5000
 
     # -----------------------------------------------------------------
     # Chronological test
@@ -122,27 +123,16 @@ class ModelConfig:
     # -----------------------------------------------------------------
 
     n_estimators: int = 600
-
     max_depth: int = 6
-
     learning_rate: float = 0.04
-
     subsample: float = 0.80
-
     colsample_bytree: float = 0.80
-
     min_child_weight: int = 5
-
     reg_alpha: float = 0.05
-
     reg_lambda: float = 1.0
-
     objective: str = "multi:softprob"
-
     eval_metric: str = "mlogloss"
-
     random_state: int = 42
-
     n_jobs: int = -1
 
     # -----------------------------------------------------------------
@@ -150,7 +140,6 @@ class ModelConfig:
     # -----------------------------------------------------------------
 
     clip_feature_min: float = -1e6
-
     clip_feature_max: float = 1e6
 
     # -----------------------------------------------------------------
@@ -589,7 +578,6 @@ class ModelBuilder:
             [
                 "StockholdersEquity",
                 "Stockholders_Equity",
-                "StockholdersEquityAbstract",
                 "TotalEquity",
                 "Equity",
             ],
@@ -874,7 +862,6 @@ class ModelBuilder:
             [
                 "StockholdersEquity",
                 "Stockholders_Equity",
-                "StockholdersEquityAbstract",
                 "TotalEquity",
                 "Equity",
             ],
@@ -2145,9 +2132,10 @@ class ModelBuilder:
     # Build feature dataframe
     # =================================================================
 
-    def _prepare_financial_data(
+    def prepare_financial_data(
         self,
         financial_data: pd.DataFrame,
+        reporting_lag_days: int = 45,
     ) -> pd.DataFrame:
         """
         Build quarterly fundamental features from financial_data.csv.
@@ -2155,6 +2143,7 @@ class ModelBuilder:
         financial_data.csv is the authoritative source for SEC fundamentals.
         Trends MUST be calculated while the data is still quarterly. Doing
         them after merging to daily prices would create false daily changes.
+        Adds point-in-time filing availability dates (45-day lag default) to prevent lookahead bias.
         """
         data = financial_data.copy()
 
@@ -2198,7 +2187,16 @@ class ModelBuilder:
         data = self.compute_financial_snapshot(data)
         data = self.compute_financial_trends(data)
         data["Date"] = pd.to_datetime(data["Date"])
-        data = data.sort_values(["Date"]).reset_index(drop=True)
+
+        # Prevent Lookahead Bias: Use FilingDate if available, or apply a 45-day lag proxy
+        if "FilingDate" in data.columns:
+            data["Filing_Availability_Date"] = pd.to_datetime(data["FilingDate"], errors="coerce")
+        elif "AcceptedDate" in data.columns:
+            data["Filing_Availability_Date"] = pd.to_datetime(data["AcceptedDate"], errors="coerce")
+        else:
+            data["Filing_Availability_Date"] = data[self.config.date_column] + pd.Timedelta(days=reporting_lag_days)
+
+        data = data.sort_values(["Filing_Availability_Date"]).reset_index(drop=True)
         return data
 
 
@@ -2259,9 +2257,7 @@ class ModelBuilder:
         # -------------------------------------------------------------
         # SEC fundamentals
         # -------------------------------------------------------------
-        fundamentals = self._prepare_financial_data(
-            financial_data
-        )
+        fundamentals = self.prepare_financial_data(financial_data)
 
         # -------------------------------------------------------------
         # Point-in-time merge
@@ -2270,91 +2266,39 @@ class ModelBuilder:
         # For each daily price observation, use the most recent financial
         # filing that was available on or before that date.
         #
-        # This is deliberately NOT a simple merge on quarter-end Date.
-        # -------------------------------------------------------------
-        # ---------------------------------------------------------------
-        # BUGFIX (combine_first upgrade): the original fix here dropped
-        # the price side's duplicate fundamental columns entirely before
-        # merging, on the assumption that financial_data.csv (documented
-        # as authoritative) would be at least as complete. Checked
-        # against the real files and that assumption doesn't hold for
-        # every field: ainyfin_data.csv's pre-baked "previous quarter"
-        # join is sometimes MORE complete than financial_data.csv's fresh
-        # table for the same field -- e.g. shares outstanding is 31.0%
-        # null in ainyfin_data.csv vs. 42.5% null in financial_data.csv;
-        # net income is 7.5% null vs. 22.4% null. Dropping ainyfin_data's
-        # columns outright was fixing the collision but leaving real,
-        # already-available coverage on the table.
-        #
-        # Rather than drop, rename the price side's copies with a
-        # temporary suffix (so they no longer collide with
-        # financial_data.csv's exact names -- the original bug), merge,
-        # then for each overlapping field prefer financial_data.csv's
-        # value and fall back to ainyfin_data.csv's baked-in value only
-        # where financial_data.csv is null. financial_data.csv still
-        # wins whenever it has data, since it's the documented
-        # authoritative/fresher source -- this only recovers coverage
-        # for rows financial_data.csv doesn't have at all.
-        STALE_SUFFIX = "__ainyfin_baked_in"
-
-        fundamental_overlap_cols = [
-            c for c in price_data.columns
-            if c in set(fundamentals.columns) and c not in (
-                self.config.ticker_column,
-                self.config.date_column,
-            )
-        ]
-        if fundamental_overlap_cols:
-            price_data = price_data.rename(
-                columns={
-                    c: f"{c}{STALE_SUFFIX}"
-                    for c in fundamental_overlap_cols
-                }
-            )
 
         left = price_data.sort_values([self.config.date_column])
-        right = fundamentals.sort_values([self.config.date_column])
+        right = fundamentals.sort_values(["Filing_Availability_Date"])
 
         data = pd.merge_asof(
             left,
             right,
             by=self.config.ticker_column,
             left_on="Date",
-            right_on="Date",
+            right_on="Filing_Availability_Date",
             direction="backward",
             allow_exact_matches=True,
+            suffixes=("", "_y"),
         )
-
-        # Fill gaps in financial_data.csv's columns from ainyfin_data's
-        # baked-in values, then drop the temporary suffixed columns.
-        for c in fundamental_overlap_cols:
-            baked_in_col = f"{c}{STALE_SUFFIX}"
-            if baked_in_col in data.columns:
-                if c in data.columns:
-                    data[c] = data[c].combine_first(data[baked_in_col])
-                else:
-                    data[c] = data[baked_in_col]
-                data = data.drop(columns=[baked_in_col])
-
-        data.to_csv(f"{AinySchema.DATA_DIR}/build_features.csv", index=False)
 
         # -------------------------------------------------------------
         # Market features
         # -------------------------------------------------------------
         data = self.compute_market_features(data)
-        data.to_csv(f"{AinySchema.DATA_DIR}/compute_market_features.csv", index=False)
 
         # -------------------------------------------------------------
         # Price-dependent valuation features
         # -------------------------------------------------------------
         data = self.compute_valuation_features(data)
-        data.to_csv(f"{AinySchema.DATA_DIR}/compute_valuation_features.csv", index=False)
 
         # -------------------------------------------------------------
         # Sector-relative features
         # -------------------------------------------------------------
         data = self.add_sector_zscores(data)
-        data.to_csv(f"{AinySchema.DATA_DIR}/add_sector_zscores.csv", index=False)
+
+        #clean-up
+        data.drop(columns=['Unnamed: 0'],inplace=True)
+        data.to_csv(f"{AinySchema.DATA_DIR}training_data.csv", index=False)
 
         return data
 
@@ -2509,7 +2453,6 @@ class ModelBuilder:
             [
                 "StockholdersEquity",
                 "Stockholders_Equity",
-                "StockholdersEquityAbstract",
                 "TotalEquity",
                 "Equity",
             ],
@@ -2700,7 +2643,7 @@ class ModelBuilder:
                 "CashAndCashEquivalentsAtCarryingValue",
                 "CashCashEquivalentsAndShortTermInvestments",
             ],
-            "Equity": ["StockholdersEquity", "StockholdersEquityAbstract"],
+            "Equity": ["StockholdersEquity"],
             "Debt": ["TotalDebt", "LongTermDebt", "LongTermDebtNoncurrent"],
             "Shares": [
                 "CommonStockSharesOutstanding",
@@ -2900,9 +2843,7 @@ class ModelBuilder:
             f"{training_filename}"
         )
 
-        price_data = pd.read_csv(
-            training_filename
-        )
+        price_data = pd.read_csv(training_filename)
 
         print(
             f"  Daily source: "
@@ -2923,9 +2864,7 @@ class ModelBuilder:
             f"{financial_filename}"
         )
 
-        financial_data = pd.read_csv(
-            financial_filename
-        )
+        financial_data = pd.read_csv(financial_filename)
 
         print(
             f"  Financial source: "
@@ -3039,35 +2978,20 @@ class ModelBuilder:
     ) -> XGBClassifier:
 
         return XGBClassifier(
-
             objective=self.config.objective,
-
             num_class=3,
-
             n_estimators=self.config.n_estimators,
-
             max_depth=self.config.max_depth,
-
             learning_rate=self.config.learning_rate,
-
             subsample=self.config.subsample,
-
             colsample_bytree=self.config.colsample_bytree,
-
             min_child_weight=self.config.min_child_weight,
-
             reg_alpha=self.config.reg_alpha,
-
             reg_lambda=self.config.reg_lambda,
-
             eval_metric=self.config.eval_metric,
-
             random_state=self.config.random_state,
-
             n_jobs=self.config.n_jobs,
-
             tree_method="hist",
-
         )
 
     # =================================================================
@@ -3357,9 +3281,7 @@ class ModelBuilder:
                 self.feature_columns
             ]
 
-            y_validation = validation[
-                "_Target"
-            ]
+            y_validation = validation["_Target"]
 
             # ---------------------------------------------------------
             # Missing-value handling
@@ -3369,14 +3291,14 @@ class ModelBuilder:
 
             model = self.create_model()
 
-            model.fit(
-                X_train,
-                y_train,
-            )
+            sample_weights = compute_sample_weight(
+                    class_weight="balanced",
+                    y=y_train,
+                )
 
-            predictions = model.predict(
-                X_validation
-            )
+            model.fit(X_train, y_train,sample_weight=sample_weights)
+
+            predictions = model.predict(X_validation)
 
             metrics = self.evaluate_predictions(
                 y_validation,
@@ -3520,10 +3442,14 @@ class ModelBuilder:
         ]
 
         model = self.create_model()
-
+        sample_weights = compute_sample_weight(
+                class_weight="balanced",
+                y=y_train,
+            )
         model.fit(
             X_train,
             y_train,
+            sample_weight=sample_weights
         )
 
         predictions = model.predict(
@@ -3671,26 +3597,13 @@ class ModelBuilder:
         data: pd.DataFrame,
     ):
 
-        print(
-            "\n"
-            + "=" * 70
-        )
+        print("\n" + "=" * 70 )
+        print("=== Training Production Model ===")
+        print("=" * 70)
 
-        print(
-            "=== Training Production Model ==="
-        )
+        X = data[self.feature_columns]
 
-        print(
-            "=" * 70
-        )
-
-        X = data[
-            self.feature_columns
-        ]
-
-        y = data[
-            "_Target"
-        ]
+        y = data["_Target"]
 
         print(
             f"Training rows: "
@@ -3703,15 +3616,17 @@ class ModelBuilder:
         )
 
         self.model = self.create_model()
-
+        sample_weights = compute_sample_weight(
+                class_weight="balanced",
+                y=y,
+            )
         self.model.fit(
             X,
             y,
+            sample_weight=sample_weights
         )
 
-        self.compute_feature_importance(
-            self.model
-        )
+        self.compute_feature_importance(self.model)
 
         return self.model
 
@@ -3754,15 +3669,12 @@ class ModelBuilder:
         ]
 
         if missing:
-
             raise ValueError(
                 "Prediction data is missing "
                 f"features: {missing}"
             )
 
-        X = data[
-            self.feature_columns
-        ]
+        X = data[self.feature_columns]
 
         probabilities = (
             self.model.predict_proba(
@@ -3787,9 +3699,7 @@ class ModelBuilder:
             ]
         ].copy()
 
-        result[
-            "Predicted_Class"
-        ] = predictions
+        result["Predicted_Class"] = predictions
 
         result[
             "P_Sell"

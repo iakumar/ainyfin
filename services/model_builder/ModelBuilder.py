@@ -72,7 +72,7 @@ class ModelConfig:
     training_file: str = f"{AinySchema.DATA_DIR}/ainyfin_data.csv"
 
     # financial_data.csv is the authoritative SEC fundamental source.
-    financial_file: str = f"{AinySchema.DATA_DIR}/financial_data.csv"
+    financial_file: str = f"{AinySchema.DATA_DIR}financial_data.csv"
 
     model_file: str = "models/ainyfin_xgb_model.json"
 
@@ -2296,7 +2296,7 @@ class ModelBuilder:
         # Market features
         # -------------------------------------------------------------
         data = self.compute_market_features(data)
-        data.to_csv(f"{AinySchema.DATA_DIR}/merged_data_with_market_features.csv", index=False)
+        data.to_csv(f"{AinySchema.DATA_DIR}merged_data_with_market_features.csv", index=False)
         #print("compute_market_features data:\n", data)
 
         # -------------------------------------------------------------
