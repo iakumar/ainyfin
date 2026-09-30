@@ -26,7 +26,6 @@ Important:
     Expected target:
         bhsScore
         1 = Sell
-        2 = Hold
         3 = Buy
 
     If your target mapping differs, change TARGET_LABELS below.
@@ -42,7 +41,6 @@ from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
-
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
@@ -50,9 +48,9 @@ from sklearn.metrics import (
     confusion_matrix,
     f1_score,
 )
-
 from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
+
 from services.consts.AinySchema import AinySchema
 
 warnings.filterwarnings("ignore")
@@ -70,7 +68,7 @@ class ModelConfig:
     # -----------------------------------------------------------------
 
     # ainyfin_data.csv is the daily price/target source.
-    training_file: str = f"{AinySchema.DATA_DIR}ainyfin_data.csv"
+    ainyfin_file: str = f"{AinySchema.DATA_DIR}ainyfin_data.csv"
 
     # financial_data.csv is the authoritative SEC fundamental source.
     financial_file: str = f"{AinySchema.DATA_DIR}financial_data.csv"
@@ -122,16 +120,16 @@ class ModelConfig:
     # XGBoost
     # -----------------------------------------------------------------
 
-    n_estimators: int = 600
-    max_depth: int = 6
+    n_estimators: int = 300
+    max_depth: int = 5
     learning_rate: float = 0.04
     subsample: float = 0.80
     colsample_bytree: float = 0.80
     min_child_weight: int = 5
     reg_alpha: float = 0.05
     reg_lambda: float = 1.0
-    objective: str = "multi:softprob"
-    eval_metric: str = "mlogloss"
+    objective: str = "binary:logistic"
+    eval_metric: str = "logloss"
     random_state: int = 42
     n_jobs: int = -1
 
@@ -167,8 +165,7 @@ class ModelBuilder:
         if self.config.target_labels is None:
             self.config.target_labels = {
                 0: "SELL",
-                1: "HOLD",
-                2: "BUY",
+                1: "BUY",
             }
 
         # -------------------------------------------------------------
@@ -176,104 +173,47 @@ class ModelBuilder:
         # -------------------------------------------------------------
 
         self.snapshot_columns = [
-
-            # ---------------------------------------------------------
-            # Valuation
-            # ---------------------------------------------------------
-
+            # Valuation (Uncorrelated core multiples)
             "Price_To_Earnings",
             "Price_To_FreeCashFlow",
             "Price_To_Book",
-            "Price_To_Sales",
-
             "EV_To_EBITDA",
-            "EV_To_EBIT",
 
-            # ---------------------------------------------------------
-            # Profitability
-            # ---------------------------------------------------------
-
+            # Profitability & Efficiency
             "Gross_Margin",
-            "Net_Margin",
-            "FCF_Margin",
             "Operating_Margin",
-            "EBITDA_Margin",
-
-            "Return_On_Equity",
-            "Return_On_Assets",
+            "FCF_Margin",
             "Return_On_Invested_Capital",
-
-            # ---------------------------------------------------------
-            # Leverage / liquidity
-            # ---------------------------------------------------------
-
-            "Debt_To_Equity",
-            "Debt_To_Assets",
-
-            "Current_Ratio",
-            "Quick_Ratio",
-
-            "Interest_Coverage",
-            "Cash_To_Debt",
-
-            "Net_Debt_To_EBITDA",
-
-            # ---------------------------------------------------------
-            # Efficiency
-            # ---------------------------------------------------------
-
             "Asset_Turnover",
             "Working_Capital_Turnover",
 
-            # ---------------------------------------------------------
-            # Cash flow quality
-            # ---------------------------------------------------------
+            # Balance Sheet & Leverage
+            "Debt_To_Assets",  # Bounded alternative to Debt_To_Equity
+            "Current_Ratio",
+            "Quick_Ratio",
+            "Net_Debt_To_EBITDA",
 
-            "CFO_To_NetIncome",
-            "CapEx_To_CFO",
-            "CapEx_To_Revenue",
-
-            # ---------------------------------------------------------
-            # Accounting / quality
-            # ---------------------------------------------------------
-
-            "SBC_To_Revenue",
+            # Accounting Quality & Earnings Management
             "Accrual_Ratio",
-
-            "Goodwill_To_Assets",
             "Intangibles_Plus_Goodwill_To_Assets",
-
+            "CFO_To_NetIncome",
+            "CapEx_To_Revenue",
+            "SBC_To_Revenue",
             "Effective_Tax_Rate",
-            "NonOperating_Income_Reliance",
+            "Deferred_Tax_To_NetIncome",
 
-            # ---------------------------------------------------------
-            # Capital allocation
-            # ---------------------------------------------------------
-
-            "Payout_To_FCF",
-            "Buyback_To_FCF",
+            # Capital Allocation & Yields
             "Reinvestment_Rate",
+            "Dividend_Yield",
+            "Buyback_Yield",
+            "Dividend_Per_Share_YoY_Growth",
 
-            # ---------------------------------------------------------
-            # Other fundamental indicators
-            # ---------------------------------------------------------
-
+            # Other Expenses
             "R_And_D_To_Revenue",
             "SGA_Intensity",
-
             "Retained_Earnings_To_Assets",
             "AOCI_To_Equity",
-
             "Operating_Lease_To_Assets",
-
-            "Deferred_Tax_To_NetIncome",
-            "Cash_Vs_Book_Tax_Gap",
-
-            "Dividend_Yield",
-            "Dividend_Per_Share_YoY_Growth",
-            "Buyback_Yield",
-
-            "Had_Goodwill_Impairment",
         ]
 
         # -------------------------------------------------------------
@@ -281,69 +221,46 @@ class ModelBuilder:
         # -------------------------------------------------------------
 
         self.trend_columns = [
-
+            # Top-Line & Earnings Growth
             "Revenue_YoY_Growth",
             "Revenue_QoQ_Growth",
             "Revenue_Acceleration",
-
             "NetIncome_YoY_Growth",
-            "EPS_YoY_Growth",
             "EBITDA_YoY_Growth",
-            "FCF_YoY_Growth",
-            "Operating_CashFlow_YoY_Growth",
+            "Shares_Outstanding_YoY_Change",  # Captures buybacks/dilution cleanly
 
+            # Margin & Efficiency Trends (Standardized to YoY)
             "Gross_Margin_YoY_Delta",
-            "EBITDA_Margin_YoY_Delta",
+            "Operating_Margin_YoY_Delta",  # Converted from QoQ to YoY for consistency
             "FCF_Margin_YoY_Delta",
-            "Operating_Margin_QoQ_Delta",
+            "ROIC_YoY_Delta",  # Single superior return-metric trend
 
-            "ROA_YoY_Delta",
-            "ROE_YoY_Delta",
-
-            # Correctly calculated ROIC trend.
-            "ROIC_YoY_Delta",
-
+            # Capital & Debt Dynamics
             "Debt_YoY_Growth",
-
-            "Shares_Outstanding_YoY_Change",
-
             "CapEx_YoY_Growth",
-
             "Working_Capital_YoY_Change",
 
+            # Risk & Volatility
             "ROE_Volatility_8Q",
             "Margin_Volatility_8Q",
 
-            # Working capital / operating efficiency
-            "DSO",
-            "DIO",
-            "DPO",
-
+            # Operational Cycle & Quality
+            "DPO",  # Drop Cash_Conversion_Cycle (implicit sum of these 3)
             "AR_Growth_vs_Revenue_Growth",
             "Inventory_Growth_vs_Revenue_Growth",
-
-            "Cash_Conversion_Cycle",
-
             "Billings_Proxy_YoY",
-
             "Deferred_Revenue_To_Revenue",
             "Deferred_Revenue_YoY_Growth",
-
             "Acquisition_Intensity",
-
             "Net_Debt_Issuance_To_Assets",
 
+            # Price & Market Dynamics
             "Realized_Vol_60D",
-
-            "Daily_Range_Pct",
-
             "Dollar_Volume_Log",
             "Volume_Vs_60D_Avg",
-
             "Momentum_1M",
             "Momentum_3M",
             "Momentum_12M_1M",
-
             "Price_Vs_52W_High",
         ]
 
@@ -363,68 +280,47 @@ class ModelBuilder:
         # -------------------------------------------------------------
 
         self.sector_base_columns = [
-
+            # Growth Metrics
             "Revenue_YoY_Growth",
             "EPS_YoY_Growth",
             "EBITDA_YoY_Growth",
             "FCF_YoY_Growth",
 
-            "Gross_Margin",
-            "Net_Margin",
+            # Level Margins
             "Operating_Margin",
             "FCF_Margin",
 
+            # Margin Deltas (Standardized to YoY)
             "Gross_Margin_YoY_Delta",
             "EBITDA_Margin_YoY_Delta",
             "FCF_Margin_YoY_Delta",
-            "Operating_Margin_QoQ_Delta",
-
+            "Operating_Margin_YoY_Delta",  # Standardized from QoQ
             "ROA_YoY_Delta",
-            "ROE_YoY_Delta",
 
-            "Debt_To_Assets",
-            "Debt_To_Equity",
-
+            # Uncorrelated Valuation Multiples
             "Price_To_Earnings",
-            "Price_To_Sales",
             "Price_To_Book",
             "Price_To_FreeCashFlow",
 
-            "CapEx_YoY_Growth",
-
-            "Working_Capital_Turnover",
-            "Working_Capital_YoY_Change",
-
-            "Margin_Volatility_8Q",
-            "ROE_Volatility_8Q",
-
+            # Balance Sheet & Leverage
             "Cash_To_Debt",
-
-            "Net_Debt_To_EBITDA",
-
-            "EV_To_EBITDA",
-            "EV_To_EBIT",
-
-            "Asset_Turnover",
-
-            "Cash_Conversion_Cycle",
-
-            "DSO",
-            "DIO",
-            "DPO",
-
-            "R_And_D_To_Revenue",
-
-            "Billings_Proxy_YoY",
-
-            "Reinvestment_Rate",
-
-            "Buyback_Yield",
-            "Dividend_Yield",
-
             "Intangibles_Plus_Goodwill_To_Assets",
 
-            "Deferred_Revenue_To_Revenue",
+            # Efficiency & Working Capital
+            "Asset_Turnover",
+            "Working_Capital_Turnover",
+            "Working_Capital_YoY_Change",
+            "CapEx_YoY_Growth",
+            "DSO",
+
+            # Volatility & Quality
+            "ROE_Volatility_8Q",
+            "R_And_D_To_Revenue",
+
+            # Capital Returns
+            "Reinvestment_Rate",
+            "Buyback_Yield",
+            "Dividend_Yield",
         ]
 
         sector_columns = [col+'_SectorZ' for col in self.sector_base_columns]
@@ -433,7 +329,6 @@ class ModelBuilder:
         self.available_training_columns = list(dict.fromkeys(self.snapshot_columns + self.trend_columns + sector_columns))
 
         self.model:XGBClassifier = None
-
         self.feature_importance:pd.DataFrame = None
 
         self.feature_columns: list[str] = []
@@ -441,6 +336,7 @@ class ModelBuilder:
             f"ModelBuilder initialized with "
             f"{len(self.available_training_columns)} model features."
         )
+
 
     # =================================================================
     # Utility methods
@@ -562,6 +458,11 @@ class ModelBuilder:
             ],
         )
 
+        data["FreeCashFlow"] = (
+            data["NetCashProvidedByUsedInOperatingActivities"]
+            - data["PaymentsToAcquirePropertyPlantAndEquipment"]
+        )
+
         debt = self._first_existing(
             data,
             [
@@ -570,6 +471,7 @@ class ModelBuilder:
                 "LongTermDebt",
                 "LongTermDebtNoncurrent",
                 "LongTermDebtCurrent",
+                "OtherLiabilitiesNoncurrent"
             ],
         )
 
@@ -779,6 +681,11 @@ class ModelBuilder:
             ],
         )
 
+        data["FreeCashFlow"] = (
+            data["NetCashProvidedByUsedInOperatingActivities"]
+            - data["PaymentsToAcquirePropertyPlantAndEquipment"]
+        )
+
         fcf = self._first_existing(
             data,
             [
@@ -896,6 +803,7 @@ class ModelBuilder:
             [
                 "TotalDebt",
                 "Debt",
+                "OtherLiabilitiesNoncurrent"
             ],
         )
 
@@ -1718,6 +1626,10 @@ class ModelBuilder:
                 "Gross_Margin_YoY_Delta",
             ),
             (
+                "Operating_Margin",
+                "Operating_Margin_YoY_Delta",
+            ),
+            (
                 "EBITDA_Margin",
                 "EBITDA_Margin_YoY_Delta",
             ),
@@ -1741,6 +1653,12 @@ class ModelBuilder:
                 "Operating_Margin"
             ].transform(
                 lambda x: x.diff(1)
+            )
+
+            data["Operating_Margin_YoY_Delta"] = grouped[
+                 "Operating_Margin"
+            ].transform(
+                lambda x: x.diff(4)
             )
 
         # -------------------------------------------------------------
@@ -1783,7 +1701,6 @@ class ModelBuilder:
         # -------------------------------------------------------------
 
         if "TotalDebt" in data.columns:
-
             data["Debt_YoY_Growth"] = grouped[
                 "TotalDebt"
             ].transform(
@@ -2484,7 +2401,7 @@ class ModelBuilder:
             ],
         )
 
-        debt = self._first_existing(data, ["TotalDebt", "Debt"])
+        debt = self._first_existing(data, ["TotalDebt", "Debt", "OtherLiabilitiesNoncurrent"])
 
         cash = self._first_existing(
             data,
@@ -2511,6 +2428,13 @@ class ModelBuilder:
             data["_Market_Cap"] = market_cap
         else:
             market_cap = None
+
+        """
+        print("close:\n",shares)
+        print("shares:\n",shares)
+        print("market_cap:\n",market_cap)
+        print("net_income:\n",net_income)
+        """
 
         if market_cap is not None:
             if net_income is not None:
@@ -2784,13 +2708,7 @@ class ModelBuilder:
             # 2 -> 1
             # 3 -> 2
             #
-            data["_Target"] = (
-                data[
-                    self.config.target_column
-                ].astype(int)
-                - 1
-            )
-
+            data["_Target"] = data[self.config.target_column].map({1: 0, 3: 1}).astype(int)
         # -------------------------------------------------------------
         # Sort
         # -------------------------------------------------------------
@@ -2823,9 +2741,7 @@ class ModelBuilder:
 
         The two files are combined inside build_features().
         """
-        training_filename = (
-            filename or self.config.training_file
-        )
+        ainyfin_filename = (filename or self.config.ainyfin_file)
         financial_filename = self.config.financial_file
 
         print("\nLoading AinyFin source datasets...")
@@ -2833,17 +2749,14 @@ class ModelBuilder:
         # -------------------------------------------------------------
         # Daily price / target source
         # -------------------------------------------------------------
-        if not os.path.exists(training_filename):
+        if not os.path.exists(ainyfin_filename):
             raise FileNotFoundError(
-                f"Training file not found: {training_filename}"
+                f"Training file not found: {ainyfin_filename}"
             )
 
-        print(
-            f"Reading daily/target data: "
-            f"{training_filename}"
-        )
-
-        price_data = pd.read_csv(training_filename)
+        print(f"Reading daily/target data: {ainyfin_filename}")
+        price_data = pd.read_csv(ainyfin_filename)
+        price_data = price_data[price_data["bhsScore"] != 2].copy()
 
         print(
             f"  Daily source: "
@@ -2902,16 +2815,7 @@ class ModelBuilder:
         )
 
         print("\nTarget distribution:")
-
-        print(
-            data[
-                self.config.target_column
-            ]
-            .value_counts(
-                normalize=True
-            )
-            .sort_index()
-        )
+        print(data[self.config.target_column].value_counts(normalize=True).sort_index())
 
         # Audit how many daily rows actually received fundamentals.
         if "FinancialDate" in data.columns:
@@ -2979,7 +2883,6 @@ class ModelBuilder:
 
         return XGBClassifier(
             objective=self.config.objective,
-            num_class=3,
             n_estimators=self.config.n_estimators,
             max_depth=self.config.max_depth,
             learning_rate=self.config.learning_rate,
@@ -3485,17 +3388,8 @@ class ModelBuilder:
             "Predicted_Class"
         ] = predictions
 
-        prediction_df[
-            "P_Sell"
-        ] = probabilities[:, 0]
-
-        prediction_df[
-            "P_Hold"
-        ] = probabilities[:, 1]
-
-        prediction_df[
-            "P_Buy"
-        ] = probabilities[:, 2]
+        prediction_df["P_Sell"] = probabilities[:, 0]
+        prediction_df["P_Buy"] = probabilities[:, 1]
 
         prediction_df[
             "Confidence"
@@ -3544,47 +3438,37 @@ class ModelBuilder:
     ) -> pd.DataFrame:
 
         model = model or self.model
-
         if model is None:
-
-            raise ValueError(
-                "No trained model available."
-            )
+            raise ValueError("No trained model available.")
 
         importance = (model.feature_importances_)
 
         result = pd.DataFrame(
             {
-                "Feature":
-                    self.feature_columns,
-                "Importance":
-                    importance,
+                "Feature": self.feature_columns,
+                "Importance": importance,
             }
         )
 
-        result = result.sort_values(
-            "Importance",
-            ascending=False,
-        ).reset_index(
-            drop=True
-        )
-
+        result = result.sort_values("Importance", ascending=False).reset_index(drop=True)
         self.feature_importance = result
 
-        print(
-            "\n"
-            + "=" * 70
-        )
+        print("\n" + "=" * 70)
+        print("=== Global Feature Importance ===")
+        print(result.to_string(index=False))
 
-        print(
-            "=== Global Feature Importance ==="
-        )
 
-        print(
-            result.to_string(
-                index=False
+        importance = model.get_booster().get_score(importance_type="gain")
+        importance_df = (
+            pd.DataFrame(
+                list(importance.items()), columns=["Feature", "ImportanceGain"]
             )
+            .sort_values("ImportanceGain", ascending=False)
+            .reset_index(drop=True)
         )
+
+        print("Top 95 Features:")
+        print(importance_df.head(95).to_string(index=False))
 
         return result
 
@@ -3701,17 +3585,8 @@ class ModelBuilder:
 
         result["Predicted_Class"] = predictions
 
-        result[
-            "P_Sell"
-        ] = probabilities[:, 0]
-
-        result[
-            "P_Hold"
-        ] = probabilities[:, 1]
-
-        result[
-            "P_Buy"
-        ] = probabilities[:, 2]
+        result["P_Sell"] = probabilities[:, 0]
+        result["P_Buy"] = probabilities[:, 1]
 
         result[
             "Confidence"

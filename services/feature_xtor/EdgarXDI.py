@@ -70,105 +70,114 @@ class EdgarXDI:
         financial_data_list = []
         for symbol in symbols:
             print(f"downloadFinancialData: {symbol}\n")
+            downloaded:bool = False
             try:
+                downloaded = False
                 company = Company(symbol)
                 df1: pd.DataFrame = company.income_statement(
                     periods=16, period="quarterly", as_dataframe=True
                 ).reset_index()
                 df1 = self.cleanup_financial_featureset(symbol, df1)
                 df1["SIC"] = company.sic
+
+                # print("income_statement df:\n",df1.columns)
+                # Concatenate all financial data into a single DataFrame
+
+                df2 = company.balance_sheet(
+                    periods=16, period="quarterly", as_dataframe=True
+                ).reset_index()
+                df2 = self.cleanup_financial_featureset(symbol, df2)
+                # print("balance_sheet df:\n",df2.columns)
+                bs_dups = ["AdditionalItems"]
+                df2 = df2.drop(columns=[c for c in bs_dups if c in df2.columns])
+
+                df3 = company.cash_flow_statement(
+                    periods=16, period="quarterly", as_dataframe=True
+                ).reset_index()
+                df3 = self.cleanup_financial_featureset(symbol, df3)
+                cf_dups = [
+                    "AccretionExpenseIncludingAssetRetirementObligations",
+                    "AdditionalItems",
+                    "AmortizationOfIntangibleAssets",
+                    "BankOwnedLifeInsuranceIncome",
+                    "CapitalizedComputerSoftwareAmortization1",
+                    "CashCashEquivalentsAndShortTermInvestments",
+                    "CryptoAssetRealizedGainLossNonoperating",
+                    "DebtAndEquitySecuritiesGainLoss",
+                    "DebtAndEquitySecuritiesRealizedGainLoss",
+                    "DebtAndEquitySecuritiesUnrealizedGainLoss",
+                    "DebtSecuritiesAvailableForSaleExcludingAccruedInterestAllowanceForCreditLossNotPreviouslyRecorded",
+                    "DebtSecuritiesRealizedGainLoss",
+                    "DebtSecuritiesTradingGainLoss",
+                    "DeferredPolicyAcquisitionCostAmortizationExpense",
+                    "DeferredPolicyAcquisitionCostsAndPresentValueOfFutureProfitsAmortization1",
+                    "DefinedBenefitPlanRecognizedNetGainLossDueToSettlements1",
+                    "DepreciationAndAmortization",
+                    "DiscontinuedOperationIncomeLossFromDiscontinuedOperationDuringPhaseOutPeriodNetOfTax",
+                    "DividendsPayableCurrent",
+                    "DividendsPayableCurrentAndNoncurrent",
+                    "EnvironmentalRemediationExpense",
+                    "EquipmentExpense",
+                    "EquitySecuritiesFvNiRealizedGainLoss",
+                    "EquitySecuritiesWithoutReadilyDeterminableFairValueImpairmentLossAnnualAmount",
+                    "FairValueOptionChangesInFairValueGainLoss1",
+                    "FinancingInterestExpense",
+                    "FinancingReceivableExcludingAccruedInterestCreditLossExpenseReversal",
+                    "ForeignCurrencyTransactionGainLossBeforeTax",
+                    "ForeignCurrencyTransactionGainLossRealized",
+                    "GainLossOnDerivativeInstrumentsNetPretax",
+                    "GainLossOnInvestments",
+                    "GainLossOnSalesOfMortgageBackedSecuritiesMBS",
+                    "GainLossRelatedToLitigationSettlement",
+                    "GainsLossesOnSalesOfInvestmentRealEstate",
+                    "GeneralAndAdministrativeExpense",
+                    "Goodwill",
+                    "GoodwillImpairmentLoss",
+                    "IncomeLossFromContinuingOperations",
+                    "IncomeLossFromContinuingOperationsIncludingPortionAttributableToNoncontrollingInterest",
+                    "IncomeLossFromDiscontinuedOperationsNetOfTax",
+                    "IncomeLossFromDiscontinuedOperationsNetOfTaxAttributableToReportingEntity",
+                    "IncomeLossFromEquityMethodInvestments",
+                    "IncomeTaxExpenseBenefit",
+                    "InsuranceServicesRevenue",
+                    "InterestExpenseNonoperating",
+                    "InterestIncomeOperatingPaidInKind",
+                    "InvestmentIncomeInterest",
+                    "LiabilityForUnpaidClaimsAndClaimsAdjustmentExpenseIncurredClaims1",
+                    "LitigationSettlementLoss",
+                    "MarketRiskBenefitChangeInFairValueGainLoss",
+                    "MarketableSecuritiesRealizedGainLossExcludingOtherThanTemporaryImpairments",
+                    "NetIncomeLoss",
+                    "NetIncomeLossAttributableToNoncontrollingInterest",
+                    "NetIncomeLossAvailableToCommonStockholdersBasic",
+                    "NonoperatingIncomeExpense",
+                    "OperatingCostsAndExpenses",
+                    "OperatingExpenses",
+                    "OperatingLeaseExpense",
+                    "OperatingLeaseLeaseIncome",
+                    "OtherInterestAndDividendIncome",
+                    "OtherNonoperatingIncomeExpense",
+                    "OtherOperatingIncomeExpenseNet",
+                    "PublicUtilitiesAllowanceForFundsUsedDuringConstructionCapitalizedCostOfEquity",
+                    "RealEstateTaxExpense",
+                    "RealizedInvestmentGainsLosses",
+                    "RestrictedCashAndInvestmentsCurrent",
+                    "RestructuringCosts",
+                    "RevenueFromContractWithCustomerIncludingAssessedTax",
+                    "SalesTypeLeaseSellingProfitLoss"
+                    "SharebasedCompensationArrangementBySharebasedPaymentAwardCompensationCost1",
+                ]
+                df3 = df3.drop(columns=[c for c in cf_dups if c in df3.columns])
+                downloaded = True
             except Exception as e:
                 print(f"Error downloading income statement for {symbol}: {e}")
-                continue
 
-            # print("income_statement df:\n",df1.columns)
-            # Concatenate all financial data into a single DataFrame
-
-            df2 = company.balance_sheet(
-                periods=16, period="quarterly", as_dataframe=True
-            ).reset_index()
-            df2 = self.cleanup_financial_featureset(symbol, df2)
-            # print("balance_sheet df:\n",df2.columns)
-            bs_dups = ["AdditionalItems"]
-            df2 = df2.drop(columns=[c for c in bs_dups if c in df2.columns])
-
-            df3 = company.cash_flow_statement(
-                periods=16, period="quarterly", as_dataframe=True
-            ).reset_index()
-            df3 = self.cleanup_financial_featureset(symbol, df3)
-            cf_dups = [
-                "AccretionExpenseIncludingAssetRetirementObligations",
-                "AdditionalItems",
-                "AmortizationOfIntangibleAssets",
-                "BankOwnedLifeInsuranceIncome",
-                "CapitalizedComputerSoftwareAmortization1",
-                "CashCashEquivalentsAndShortTermInvestments",
-                "CryptoAssetRealizedGainLossNonoperating",
-                "DebtAndEquitySecuritiesGainLoss",
-                "DebtAndEquitySecuritiesRealizedGainLoss",
-                "DebtAndEquitySecuritiesUnrealizedGainLoss",
-                "DebtSecuritiesAvailableForSaleExcludingAccruedInterestAllowanceForCreditLossNotPreviouslyRecorded",
-                "DebtSecuritiesRealizedGainLoss",
-                "DebtSecuritiesTradingGainLoss",
-                "DeferredPolicyAcquisitionCostAmortizationExpense",
-                "DeferredPolicyAcquisitionCostsAndPresentValueOfFutureProfitsAmortization1",
-                "DefinedBenefitPlanRecognizedNetGainLossDueToSettlements1",
-                "DepreciationAndAmortization",
-                "DiscontinuedOperationIncomeLossFromDiscontinuedOperationDuringPhaseOutPeriodNetOfTax",
-                "DividendsPayableCurrent",
-                "DividendsPayableCurrentAndNoncurrent",
-                "EnvironmentalRemediationExpense",
-                "EquipmentExpense",
-                "EquitySecuritiesFvNiRealizedGainLoss",
-                "EquitySecuritiesWithoutReadilyDeterminableFairValueImpairmentLossAnnualAmount",
-                "FairValueOptionChangesInFairValueGainLoss1",
-                "FinancingInterestExpense",
-                "FinancingReceivableExcludingAccruedInterestCreditLossExpenseReversal",
-                "ForeignCurrencyTransactionGainLossBeforeTax",
-                "ForeignCurrencyTransactionGainLossRealized",
-                "GainLossOnDerivativeInstrumentsNetPretax",
-                "GainLossOnInvestments",
-                "GainLossOnSalesOfMortgageBackedSecuritiesMBS",
-                "GainLossRelatedToLitigationSettlement",
-                "GainsLossesOnSalesOfInvestmentRealEstate",
-                "GeneralAndAdministrativeExpense",
-                "Goodwill",
-                "GoodwillImpairmentLoss",
-                "IncomeLossFromContinuingOperations",
-                "IncomeLossFromContinuingOperationsIncludingPortionAttributableToNoncontrollingInterest",
-                "IncomeLossFromDiscontinuedOperationsNetOfTax",
-                "IncomeLossFromDiscontinuedOperationsNetOfTaxAttributableToReportingEntity",
-                "IncomeLossFromEquityMethodInvestments",
-                "IncomeTaxExpenseBenefit",
-                "InsuranceServicesRevenue",
-                "InterestExpenseNonoperating",
-                "InterestIncomeOperatingPaidInKind",
-                "InvestmentIncomeInterest",
-                "LiabilityForUnpaidClaimsAndClaimsAdjustmentExpenseIncurredClaims1",
-                "LitigationSettlementLoss",
-                "MarketRiskBenefitChangeInFairValueGainLoss",
-                "MarketableSecuritiesRealizedGainLossExcludingOtherThanTemporaryImpairments",
-                "NetIncomeLoss",
-                "NetIncomeLossAttributableToNoncontrollingInterest",
-                "NetIncomeLossAvailableToCommonStockholdersBasic",
-                "NonoperatingIncomeExpense",
-                "OperatingCostsAndExpenses",
-                "OperatingExpenses",
-                "OperatingLeaseExpense",
-                "OperatingLeaseLeaseIncome",
-                "OtherInterestAndDividendIncome",
-                "OtherNonoperatingIncomeExpense",
-                "OtherOperatingIncomeExpenseNet",
-                "PublicUtilitiesAllowanceForFundsUsedDuringConstructionCapitalizedCostOfEquity",
-                "RealEstateTaxExpense",
-                "RealizedInvestmentGainsLosses",
-                "RestrictedCashAndInvestmentsCurrent",
-                "RestructuringCosts",
-                "RevenueFromContractWithCustomerIncludingAssessedTax",
-                "SalesTypeLeaseSellingProfitLoss"
-                "SharebasedCompensationArrangementBySharebasedPaymentAwardCompensationCost1",
-            ]
-            df3 = df3.drop(columns=[c for c in cf_dups if c in df3.columns])
+            if downloaded == False:
+                print("Company:", company.get_filings())
+                financials = company.get_financials()
+                df1 = financials.income_statement()
+                df2 = financials.balance_sheet()
+                df3 = financials.cash_flow_statement()
 
             # print("cash_flow_statement df:\n",df3.columns)
             for df in [df1, df2, df3]:
@@ -184,16 +193,6 @@ class EdgarXDI:
             financial_data_list.append(merged_df)
 
         final_df = pd.concat(financial_data_list, ignore_index=True).copy()
-        final_df["TotalDebt"] = (
-            final_df["LongTermDebtNoncurrent"] + final_df["LongTermDebtCurrent"]
-        )
-        final_df["WorkingCapital"] = (
-            final_df["AssetsCurrent"] - final_df["LiabilitiesCurrent"]
-        )
-        final_df["FreeCashFlow"] = (
-            final_df["NetCashProvidedByUsedInOperatingActivities"]
-            - final_df["PaymentsToAcquirePropertyPlantAndEquipment"]
-        )
 
         abstract_cols = [c for c in final_df.columns if c.endswith("Abstract")]
         final_df = final_df.drop(columns=abstract_cols)

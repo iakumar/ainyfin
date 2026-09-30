@@ -18,14 +18,6 @@ class FeatureExtractor:
         self.look_ahead_days = 30
 
         self.symbols: list[str] = [
-            'AAPL', 'AMD', 'AMZN', 'ABNB', 'CBRE', 'CMCSA', 'CRWD', 'DAL', 'DUK', 'EOG',
-            'ETN', 'GE', 'GEV', 'GOOG', 'GOOGL', 'GRMN', 'GS', 'HOOD', 'ICE', 'INTU',
-            'IQV', 'IR', 'JNJ', 'JPM', 'KO', 'LRCX', 'LYB', 'MANH', 'MDLZ', 'META',
-            'MRK', 'MSFT', 'NET', 'NFLX', 'NVDA', 'PANW', 'PG', 'PLTR', 'PSX', 'RH',
-            'SNOW', 'SO', 'T', 'TMO', 'TSLA', 'TT', 'TROW', 'V', 'WFC', 'WMT',
-            'XOM', 'XYZ', 'Z']
-
-        self.symbols2: list[str] = [
             # --- Original List ---
             'AAPL', 'AMD', 'AMZN', 'ABNB', 'CBRE', 'CMCSA', 'CRWD', 'DAL', 'DUK', 'EOG',
             'ETN', 'GE', 'GEV', 'GOOG', 'GOOGL', 'GRMN', 'GS', 'HOOD', 'ICE', 'INTU',
@@ -85,6 +77,16 @@ class FeatureExtractor:
             '857480610', '857480628', 'AMLP', 'IWN', 'CCMAZ', 'FBCGX', 'FGKFX', 'FBGRX', 'FFSFX', 'FLKSX', 'FXAIX', 'FELV', 'GLD',
             'WFPRX'
         ]
+
+        self.etf:list[str] = [
+            'SPYG', 'SPY', 'SPMO', 'USO'
+        ]
+
+        #first 100 elements
+        self.symbols = self.symbols[:300]
+        self.symbols = ['SPY','SPYG','SPMO']
+        self.symbols = ['MANH','ICE','AMD']
+
         self.status:str = 'Done'
 
 
@@ -95,7 +97,7 @@ class FeatureExtractor:
         training_window = 4 * 365
         today = datetime.now(timezone.utc).date()
         start_date = today - timedelta(days=training_window)
-        end_date = today
+        end_date = today + timedelta(days=1)
 
 
         #2 Price
@@ -180,21 +182,51 @@ class FeatureExtractor:
         #print("price_df:\n",price_df)
 
         #2 Self-merge to find the nearest price on the target date for each stock
-        price_target_df = pd.merge_asof(
+        price_tgt_df = pd.merge_asof(
             price_df.sort_values(["TargetDate"]),
             price_df[["Ticker", "Date", "Close"]].sort_values(["Date"]),
             by="Ticker",
             left_on="TargetDate",
             right_on="Date",
-            direction="forward",
-            tolerance=pd.Timedelta(days=3),
+            direction="backward",
+            tolerance=pd.Timedelta(days=5),
             suffixes=("", "_Target")
         )
 
         #Filter out records where TargetDate is in the future
-        today = pd.Timestamp.today().normalize()
-        price_target_df = price_target_df[price_target_df["Date_Target"] <= today].copy()
+        max_available_date = price_tgt_df["Date"].max()
+        price_tgt_df = price_tgt_df[price_tgt_df["TargetDate"] <= max_available_date].copy()
+        price_tgt_df["Stock_Pct_Return"] = (price_tgt_df["Close_Target"] / price_tgt_df["Close"] - 1.0) * 100.0
+        price_tgt_df.dropna(subset=["Stock_Pct_Return"], inplace=True)
 
+        universe_mean_return = price_tgt_df.groupby("Date")["Stock_Pct_Return"].transform("mean")
+        price_tgt_df["Excess_Return"] = price_tgt_df["Stock_Pct_Return"] - universe_mean_return
+
+        LOWER_QUANTILE = 0.40  # Bottom 40% = Sell
+        UPPER_QUANTILE = 0.60  # Top 40% = Buy
+        def assign_classes_with_buffer(group):
+            if len(group) < 3:
+                return pd.Series(np.nan, index=group.index)
+
+            p_low = group["Excess_Return"].quantile(LOWER_QUANTILE)
+            p_high = group["Excess_Return"].quantile(UPPER_QUANTILE)
+
+            # Initialize all as 2 (Hold/Middle buffer)
+            labels = pd.Series(2, index=group.index, dtype=int)
+
+            # Assign class 1 (Bearish) and class 3 (Bullish) or 0 and 1 if binary
+            labels[group["Excess_Return"] <= p_low] = 1  # Sell
+            labels[group["Excess_Return"] >= p_high] = 3  # Buy
+            return labels
+
+        price_tgt_df["bhsScore"] = price_tgt_df.groupby("Date", group_keys=False).apply(assign_classes_with_buffer)
+
+        # FILTER OUT THE NEUTRAL BUFFER ZONE
+        # This removes border-case noise from your training data
+        price_tgt_df.dropna(subset=["bhsScore"], inplace=True)
+        price_tgt_df["bhsScore"] = price_tgt_df["bhsScore"].astype(int)
+
+        """
         price_target_df['Pct_Diff'] = (price_target_df['Close_Target']/price_target_df['Close'] - 1) * 100
         #print("price_target_df:",price_target_df['Pct_Diff'])
         price_target_df.dropna(subset=['Pct_Diff'],inplace=True)
@@ -204,20 +236,20 @@ class FeatureExtractor:
         # 1:Sell, 2: Hold, 3: Buy
         labels = [1, 2, 3]
         price_target_df['bhsScore'] = pd.cut(price_target_df['Pct_Diff'], bins=bins, labels=labels, include_lowest=True).astype(int)
+        """
 
         # 2. Clean up the temporary column
-        price_target_df.drop(columns=['Unnamed: 0','Date_Target'],inplace=True)
-        price_target_df['Date'] = pd.to_datetime(price_target_df['Date'])
-        price_target_df = price_target_df.sort_values('Date').reset_index(drop=True)
-        print("price_target_df:\n",price_target_df)
-        price_target_df.to_csv(AinySchema.DATA_DIR+'ainyfin_data.csv')
+        price_tgt_df.drop(columns=['Unnamed: 0','Date_Target'],inplace=True)
+        price_tgt_df['Date'] = pd.to_datetime(price_tgt_df['Date'])
+        price_tgt_df = price_tgt_df.sort_values('Date').reset_index(drop=True)
+        price_tgt_df.to_csv(AinySchema.DATA_DIR+'ainyfin_data.csv')
         self.status = 'Done'
 
 
 def main():
     print(f"=== Starting Feature Extraction : {datetime.now(ZoneInfo('America/New_York')).date()} ===")
     featureExtractor = FeatureExtractor("BHS")
-    featureExtractor.download()
+    #featureExtractor.download()
     if featureExtractor.status == 'Done':
         print("=== Feature Download Completed Successfully ===")
         featureExtractor.load();
