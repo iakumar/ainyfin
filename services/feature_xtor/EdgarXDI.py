@@ -1,5 +1,7 @@
 import pandas as pd
+import datetime
 from edgar import Company, set_identity
+from edgar import Fund
 
 from services.consts.AinySchema import AinySchema
 
@@ -71,10 +73,13 @@ class EdgarXDI:
         for symbol in symbols:
             print(f"downloadFinancialData: {symbol}\n")
             downloaded:bool = False
+            df1:pd.DataFrame = pd.DataFrame()
+            df2:pd.DataFrame = pd.DataFrame()
+            df3:pd.DataFrame = pd.DataFrame()
             try:
                 downloaded = False
                 company = Company(symbol)
-                df1: pd.DataFrame = company.income_statement(
+                df1 = company.income_statement(
                     periods=16, period="quarterly", as_dataframe=True
                 ).reset_index()
                 df1 = self.cleanup_financial_featureset(symbol, df1)
@@ -173,13 +178,33 @@ class EdgarXDI:
                 print(f"Error downloading income statement for {symbol}: {e}")
 
             if downloaded == False:
-                print("Company:", company.get_filings())
-                financials = company.get_financials()
-                df1 = financials.income_statement()
-                df2 = financials.balance_sheet()
-                df3 = financials.cash_flow_statement()
+                print("Company:", company)
+                #print("Companyget_filings:", company.get_filings())
+                current_year = datetime.datetime.today().year
+                years_list = [current_year - i for i in range(5)]
+                #filings = company.get_filings(year=years_list)
+                #for filing in filings:
+                #    print(f"{filing.form}: {filing.company} ({filing.filing_date})")
+                #    print(filing.to_dict())
+                #    print(filing.obj())
 
-            # print("cash_flow_statement df:\n",df3.columns)
+                filings_list = company.get_filings(form=["NPORT-P",'N-30D'], trigger_full_load=False)
+                # Extract portfolio holdings DataFrame from the most recent NPORT-P filing
+                for filing in filings_list:
+                    if filing == None or filing.obj() == None:
+                        print("filing_obj is None for filing:", filing)
+                    else:
+                        print(f"{filing.form}: {filing.company} ({filing.filing_date})")
+                        print(filing.to_dict())
+                        filing_obj = filing.obj()
+                        print("filing_obj:\n",filing_obj)
+                        holdings_df = filing_obj.investment_data()
+                        print("Holdings:\n",holdings_df.head())
+
+            if df1.empty or df2.empty or df3.empty:
+                print(f"Skipping {symbol} due to empty DataFrames.")
+                continue
+
             for df in [df1, df2, df3]:
                 df["Date"] = pd.to_datetime(df["Date"])
 

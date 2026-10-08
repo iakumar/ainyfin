@@ -11,6 +11,7 @@ import yfinance as yf
 from services.consts.AinySchema import AinySchema
 from services.feature_xtor.FeatureXtor import FeatureExtractor
 from services.model_builder.ModelBuilder_CL import ModelBuilder
+from services.analyzer.CoreAnalyzer import AinyFinSwingEngine
 
 BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "anypug.appspot.com")
 DIRECTORY_NAME = "ainyfin/models"
@@ -34,7 +35,7 @@ class Predictor:
 
         self.xg_model = modelBuilder.load_model()
         #print("Model Running:",  self.xg_model)
-        print("Model Running")
+        #print("Model Running")
 
         # 1. Get raw normalized importance scores
         importances = self.xg_model.feature_importances_
@@ -44,7 +45,7 @@ class Predictor:
             'Feature': self.xg_model.feature_names_in_,
             'Importance': importances}).sort_values(by='Importance', ascending=False)
 
-        print(feature_imp_df.to_string())
+        #print(feature_imp_df.to_string())
 
 
     def create_input(self, modelBuilder:ModelBuilder, tickers):
@@ -266,11 +267,11 @@ class Predictor:
 
 def main(args:list[str]):
     tickerlist:list[str] = []
-    if len(args) < 1:
+    if len(args) > 1:
+        tickerlist = [ticker.strip() for ticker in args[1].split(",")]
+    else:
         featureExtractor = FeatureExtractor("BHS")
         tickerlist = featureExtractor.symbols
-    else:
-        tickerlist = [ticker.strip() for ticker in args[0].split(",")]
 
     if len(tickerlist) < 1:
         print("Ticker list needed")
@@ -280,6 +281,7 @@ def main(args:list[str]):
     modelBuilder = ModelBuilder("xg")
     predictor.init_runtime(modelBuilder)
 
+    ticker_dict = {}
     input_df = predictor.create_input(modelBuilder, tickerlist)
     if input_df.empty == False:
         valid_tickers = input_df['Ticker'].tolist()
@@ -295,17 +297,29 @@ def main(args:list[str]):
             close = ticker_df["Close"].item()
 
             print(
-                f"{ticker}: {info['Action']} @ {close:.2f} | {info['Confidence']} | "
+                f"{ticker}: {info['Action']} @ {close:.2f} | {info['Confidence']}"
                 f"{info['Probabilities']} | Supported by: {supp_str} | Weakened by: {weak_str}"
             )
 
             record = [ticker, today, info['Action'], f"{close:.2f}",  info['Confidence'], ",".join(info["Supported_By"]), ",".join(info["Weakened_By"])]
             reco_list.append(record)
+            print(f"Record for {ticker}:", info['Probabilities'].get('Buy'))
+            ticker_dict[ticker] = info['Probabilities'].get('Buy')
 
         reco_df = pd.DataFrame(reco_list, columns=["Ticker", "Date", "Action", "Price", "Confidence", "SupportedBy", "WeakenedBy"])
         reco_df.to_csv(AinySchema.DATA_DIR + "reco_ticker.csv", index=False)
+
+        period:int = 365
+        if len(args) > 0:
+            period = int(args[0])
+
+        # 1. Instantiate Engine & Execute Analysis
+        engine = AinyFinSwingEngine()
+        engine.analyze_tickers(period, ticker_dict)
+
     else:
         print("No input data available for tickers.")
+
 
 if __name__ == "__main__":
     main(sys.argv[1:])

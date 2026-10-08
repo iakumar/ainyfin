@@ -3782,15 +3782,8 @@ class ModelBuilder:
                 self.available_training_columns
             )
 
-        print(
-            f"Model loaded from: "
-            f"{filename}"
-        )
-
-        print(
-            f"Feature schema: "
-            f"{len(self.feature_columns)} features"
-        )
+        print(f"Model loaded from: {filename}")
+        print(f"Feature schema: {len(self.feature_columns)} features")
 
         return self.model
 

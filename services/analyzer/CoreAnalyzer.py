@@ -9,6 +9,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 from pathlib import Path
+import ast
 
 import numpy as np
 import pandas as pd
@@ -86,29 +87,30 @@ class AinyFinSwingEngine:
             "Drivers": reasons
         }
 
-    def CalculateVolatilityStats(self, ticker:str, df_intraday: pd.DataFrame) -> Dict[str, float]:
+    def CalculateVolatilityStats(self, ticker:str, intraday_full_df: pd.DataFrame, period:int) -> Dict[str, float]:
         """
         Calculates price fluctuation statistics:
         - Average Daily High-Low Range
         - Days with High-Low Diff >= 2%
         - Days with UP / DOWN swings >= 2% from Prev Close
         """
-        if df_intraday.empty:
+        if intraday_full_df.empty:
             return {}
 
-        df_intraday['High_Low_Diff'] = df_intraday['High'] - df_intraday['Low']
-        df_intraday['High_Low_Pct'] = (df_intraday['High_Low_Diff'] / df_intraday['Close']) * 100.0
-        df_intraday['Up_Diff_Pct'] = ((df_intraday['High'] - df_intraday['Prev_Close']) / df_intraday['Prev_Close']) * 100.0
-        df_intraday['Down_Diff_Pct'] = ((df_intraday['Prev_Close'] - df_intraday['Low']) / df_intraday['Prev_Close']) * 100.0
+        intraday_df = intraday_full_df.tail(period)
+        intraday_df['High_Low_Diff'] = intraday_df['High'] - intraday_df['Low']
+        intraday_df['High_Low_Pct'] = (intraday_df['High_Low_Diff'] / intraday_df['Close']) * 100.0
+        intraday_df['Up_Diff_Pct'] = ((intraday_df['High'] - intraday_df['Prev_Close']) / intraday_df['Prev_Close']) * 100.0
+        intraday_df['Down_Diff_Pct'] = ((intraday_df['Prev_Close'] - intraday_df['Low']) / intraday_df['Prev_Close']) * 100.0
 
-        total_days = len(df_intraday)
-        avg_price = df_intraday['Close'].mean()
-        avg_range = df_intraday['High_Low_Diff'].mean()
-        avg_range_pct = df_intraday['High_Low_Pct'].mean()
+        total_days = len(intraday_df)
+        avg_price = intraday_df['Close'].mean()
+        avg_range = intraday_df['High_Low_Diff'].mean()
+        avg_range_pct = intraday_df['High_Low_Pct'].mean()
 
-        days_range_gte_2pct = (df_intraday['High_Low_Pct'] >= 2.0).sum()
-        up_days_gte_2pct = (df_intraday['Up_Diff_Pct'] >= 2.0).sum()
-        down_days_gte_2pct = (df_intraday['Down_Diff_Pct'] >= 2.0).sum()
+        days_range_gte_2pct = (intraday_df['High_Low_Pct'] >= 2.0).sum()
+        up_days_gte_2pct = (intraday_df['Up_Diff_Pct'] >= 2.0).sum()
+        down_days_gte_2pct = (intraday_df['Down_Diff_Pct'] >= 2.0).sum()
 
         return {
             "Ticker": ticker,
@@ -205,6 +207,7 @@ class AinyFinSwingEngine:
         input_df['Prev_Close'] = input_df.groupby('Ticker')['Close'].shift(1)
         return input_df
 
+
     def get_current_price(self, tickerlist:list[str]):
         today = datetime.now(timezone.utc).date()
         start_date = today - timedelta(days=3)
@@ -227,71 +230,90 @@ class AinyFinSwingEngine:
         return latest_price_df
 
 
+    def analyze_tickers(self, period:int, ticker_dict:dict):
+        if len(ticker_dict) == 0:
+            featureExtractor = FeatureExtractor("BHS")
+            tickerlist = featureExtractor.symbols
+            for ticker in tickerlist:
+                ticker_dict[ticker] = 0.5  # Default probability if not provided
+        else:
+            tickerlist = list(ticker_dict.keys())
+
+        if len(tickerlist) < 1:
+            print("Ticker list needed")
+            return
+
+        print("Analyzing Tickers:", tickerlist, "for period:", period, "days")
+
+        input_df = self.create_input(tickerlist)
+        latest_price_df =  self.get_current_price(tickerlist)
+
+        for ticker in tickerlist:
+            input_ticker_df = input_df[input_df["Ticker"] == ticker].copy()
+            input_ticker_df['Date'] = pd.to_datetime(input_ticker_df['Date'])
+            latest_row:pd.DataFrame = input_ticker_df[input_ticker_df['Date'] == input_ticker_df['Date'].max()]
+            feature_series:pd.Series = latest_row.iloc[0]
+
+            """
+            print("closes:",input_ticker_df['Close'])
+            print("highs:",input_ticker_df['High'])
+            print("lows:",input_ticker_df['Low'])
+            print("prev_closes:",input_ticker_df['Prev_Close'])
+            """
+
+            # 2. Compute High-Low Daily Volatility
+            volatility_df:pd.DataFrame = pd.DataFrame({
+                'Close': input_ticker_df['Close'],
+                'High': input_ticker_df['High'],
+                'Low': input_ticker_df['Low'],
+                'Prev_Close': input_ticker_df['Prev_Close']
+            })
+
+            print("=== Ticker:",ticker,"===\n")
+
+            # 2. Compute Volatility Statistics
+            vol_stats = self.CalculateVolatilityStats(ticker, volatility_df, period)
+            print("=== Volatility & Fluctuation Profile ===")
+            for k, v in vol_stats.items():
+                print(f"  {k}: {v:.2f}" if isinstance(v, float) else f"  {k}: {v}")
+
+            latest_price_ticker_df = latest_price_df[latest_price_df["Ticker"] == ticker]
+            #print("latest_price_ticker_df:\n",latest_price_ticker_df)
+            current_price = latest_price_ticker_df.iloc[0].get('Close')
+            # 3. Generate Strategy Trade Decision
+            trade_signal = self.GenerateSwingSignals(
+                ticker,
+                feature_row=feature_series,
+                current_price=current_price,
+                prob_buy=ticker_dict[ticker],
+                vol_stats=vol_stats
+            )
+
+            print("\n=== Strategic Allocation Signal ===")
+            for k, v in trade_signal.items():
+                print(f"  {k}: {v}")
+
+            print("===" * 20)
+
+
+#"{'AMD':0.67, 'ICE':0.55, 'AAPL':0.72, 'MSFT':0.61, 'GOOG':0.58, 'AMZN':0.63}"
 def main(args:list[str]):
-    tickerlist:list[str] = []
+    period:int = 365
+    if len(args) > 0:
+        period = int(args[0])
 
-    if len(args) < 1:
-        featureExtractor = FeatureExtractor("BHS")
-        tickerlist = featureExtractor.symbols
-    else:
-        tickerlist = [ticker.strip() for ticker in args[0].split(",")]
-
-    if len(tickerlist) < 1:
-        print("Ticker list needed")
-        return
+    # Safely convert string to dictionary
+    ticker_dict = {}
+    try:
+        if len(args) > 1:
+            ticker_dict = ast.literal_eval(args[1])
+    except (ValueError, SyntaxError) as e:
+        print(error=f"Malformed string argument: {e}")
 
     # 1. Instantiate Engine & Execute Analysis
-    engine = AinyFinSwingEngine(core_conviction_threshold=65.0)
-    input_df = engine.create_input(tickerlist)
-    latest_price_df =  engine.get_current_price(tickerlist)
+    engine = AinyFinSwingEngine()
+    engine.analyze_tickers(period, ticker_dict)
 
-    for ticker in tickerlist:
-        input_ticker_df = input_df[input_df["Ticker"] == ticker].copy()
-        input_ticker_df['Date'] = pd.to_datetime(input_ticker_df['Date'])
-        latest_row:pd.DataFrame = input_ticker_df[input_ticker_df['Date'] == input_ticker_df['Date'].max()]
-        feature_series:pd.Series = latest_row.iloc[0]
-
-        """
-        print("closes:",input_ticker_df['Close'])
-        print("highs:",input_ticker_df['High'])
-        print("lows:",input_ticker_df['Low'])
-        print("prev_closes:",input_ticker_df['Prev_Close'])
-        """
-
-        # 2. Compute High-Low Daily Volatility
-        volatility_df:pd.DataFrame = pd.DataFrame({
-            'Close': input_ticker_df['Close'],
-            'High': input_ticker_df['High'],
-            'Low': input_ticker_df['Low'],
-            'Prev_Close': input_ticker_df['Prev_Close']
-        })
-
-        print("=== Ticker:",ticker,"===\n")
-
-        # 2. Compute Volatility Statistics
-        vol_stats = engine.CalculateVolatilityStats(ticker,
-                                                    volatility_df)
-        print("=== Volatility & Fluctuation Profile ===")
-        for k, v in vol_stats.items():
-            print(f"  {k}: {v:.2f}" if isinstance(v, float) else f"  {k}: {v}")
-
-        latest_price_ticker_df = latest_price_df[latest_price_df["Ticker"] == ticker]
-        #print("latest_price_ticker_df:\n",latest_price_ticker_df)
-        current_price = latest_price_ticker_df.iloc[0].get('Close')
-        # 3. Generate Strategy Trade Decision
-        trade_signal = engine.GenerateSwingSignals(
-            ticker,
-            feature_row=feature_series,
-            current_price=current_price,
-            prob_buy=0.612,  # 61.2% model probability
-            vol_stats=vol_stats
-        )
-
-        print("\n=== Strategic Allocation Signal ===")
-        for k, v in trade_signal.items():
-            print(f"  {k}: {v}")
-
-        print("===" * 20)
 
 if __name__ == "__main__":
     main(sys.argv[1:])

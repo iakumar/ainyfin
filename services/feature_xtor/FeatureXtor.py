@@ -84,8 +84,8 @@ class FeatureExtractor:
 
         #first 100 elements
         self.symbols = self.symbols[:300]
-        self.symbols = ['SPY','SPYG','SPMO']
-        self.symbols = ['MANH','ICE','AMD']
+        #self.symbols = ['SPY','SPYG','SPMO']
+        #self.symbols = ['MANH','ICE','AMD']
 
         self.status:str = 'Done'
 
@@ -202,8 +202,8 @@ class FeatureExtractor:
         universe_mean_return = price_tgt_df.groupby("Date")["Stock_Pct_Return"].transform("mean")
         price_tgt_df["Excess_Return"] = price_tgt_df["Stock_Pct_Return"] - universe_mean_return
 
-        LOWER_QUANTILE = 0.40  # Bottom 40% = Sell
-        UPPER_QUANTILE = 0.60  # Top 40% = Buy
+        LOWER_QUANTILE = 0.25  # Bottom 40% = Sell
+        UPPER_QUANTILE = 0.75  # Top 40% = Buy
         def assign_classes_with_buffer(group):
             if len(group) < 3:
                 return pd.Series(np.nan, index=group.index)
