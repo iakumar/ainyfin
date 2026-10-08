@@ -1,6 +1,6 @@
 import tempfile
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -19,18 +19,18 @@ class FeatureExtractor:
 
         self.symbols: list[str] = [
             # --- Original List ---
-            'AAPL', 'AMD', 'AMZN', 'ABNB', 'CBRE', 'CMCSA', 'CRWD', 'DAL', 'DUK', 'EOG',
+            'AAPL', 'AMD', 'AMZN', 'ABNB', 'ASML', 'CBRE', 'CRWD', 'DAL', 'DUK', 'EOG',
             'ETN', 'GE', 'GEV', 'GOOG', 'GOOGL', 'GRMN', 'GS', 'HOOD', 'ICE', 'INTU',
-            'IQV', 'IR', 'JNJ', 'JPM', 'KO', 'LRCX', 'LYB', 'MANH', 'MDLZ', 'META',
-            'MRK', 'MSFT', 'NET', 'NFLX', 'NVDA', 'PANW', 'PG', 'PLTR', 'PSX', 'RH',
-            'SNOW', 'SO', 'T', 'TMO', 'TSLA', 'TT', 'TROW', 'V', 'WFC', 'WMT',
-            'XOM', 'XYZ', 'Z',
+            'IQV', 'IR', 'JNJ', 'JPM', 'KO', 'LRCX', 'MANH', 'MDLZ', 'META',
+            'MRK', 'MSFT', 'NET', 'NFLX', 'NVDA', 'PANW', 'PG', 'PLTR', 'PSX',
+            'SNOW', 'SO', 'T', 'TMO', 'TSLA', 'TSM', 'TT', 'TROW', 'V', 'WFC', 'WMT',
+            'XOM', 'XYZ',
 
             # --- Appended S&P 500 Components ---
             'A', 'AAL', 'ABBV', 'ABT', 'ACGL', 'ACN', 'ADBE', 'ADI', 'ADM',
             'ADP', 'ADSK', 'AEE', 'AEP', 'AES', 'AFL', 'AIG', 'AIZ', 'AJG', 'AKAM',
-            'ALB', 'ALGN', 'ALL', 'ALLE', 'ALNT', 'AMCR', 'AME', 'AMGN', 'AMP', 'AMT',
-            'ANET', 'AON', 'APA', 'APD', 'APH', 'APTV', 'ARE', 'ATO',
+            'ALB', 'ALGN', 'ALL', 'ALLE', 'ALNT', 'AMAT', 'AMCR', 'AME', 'AMGN', 'AMP',
+            'AMT', 'ANET', 'AON', 'APA', 'APD', 'APH', 'APTV', 'ARE', 'ATO',
             'AVB', 'AVGO', 'AVY', 'AWK', 'AXON', 'AXP', 'BA', 'BAC', 'BALL', 'BAX',
             'BBY', 'BDX', 'BEN', 'BG', 'BIIB', 'BIO', 'BKNG', 'BKR',
             'BLK', 'BLDR', 'BMY', 'BR', 'BRO', 'BSX', 'BWA', 'BXP', 'C',
@@ -63,7 +63,7 @@ class FeatureExtractor:
             'PODD', 'POOL', 'PPG', 'PPL', 'PRU', 'PSA', 'PTC', 'PWR', 'PYPL', 'QCOM',
             'QRVO', 'RCL', 'REG', 'REGN', 'RF', 'RHI', 'RJF', 'RL', 'RMD', 'ROK',
             'ROL', 'ROP', 'ROST', 'RSG', 'RTX', 'RVTY', 'SBAC', 'SBUX', 'SCHW', 'SHW',
-            'SJM', 'SLB', 'SNA', 'SNPS', 'SPG', 'SPGI', 'SRE', 'STE', 'STT', 'STX',
+            'SJM', 'SLB', 'SNA', 'SNPS', 'SPCX', 'SPG', 'SPGI', 'SRE', 'STE', 'STT', 'STX',
             'STZ', 'SWK', 'SWKS', 'SYK', 'SYY', 'TAP', 'TDG', 'TDY', 'TECH', 'TEL',
             'TER', 'TFC', 'TFX', 'TGT', 'TJX', 'TMUS', 'TPR', 'TRGP', 'TRMB', 'TRV',
             'TSCO', 'TSN', 'TTWO', 'TXN', 'TXT', 'TYL', 'UA', 'UAA', 'UAL', 'UBER',
@@ -82,20 +82,37 @@ class FeatureExtractor:
             'SPYG', 'SPY', 'SPMO', 'USO'
         ]
 
-        #first 100 elements
+        #first 300 elements
         self.symbols = self.symbols[:300]
-        self.symbols = ['SPY','SPYG','SPMO']
-        self.symbols = ['MANH','ICE','AMD']
+        #self.symbols = ['SPY','SPYG','SPMO']
+        #
+        symbols_F = ['AAPL', 'ABNB', 'AMD', 'AMGN', 'ASML', 'CRWD', 'DAL', 'DUK', 'EOG', 'ETN', 'GE', 'GEV', 'GOOGL', 'GRMN', 'GS',
+                        'INTU', 'IQV', 'JNJ', 'JPM', 'KO', 'LRCX', 'MANH', 'MRK', 'MSFT', 'NET', 'NFLX', 'NVDA', 'PG', 'PLTR',
+                         'SO', 'SPCX', 'T', 'TSM', 'TSLA']
 
+        symbols_M = ['C', 'CBRE', 'GOOG', 'HOOD', 'ICE', 'IR', 'MDLZ', 'META', 'NET', 'NFLX', 'PANW', 'PSX', 'SNOW', 'TMO', 'TROW', 'TT',
+                          'SNOW', 'T', 'TMO', 'TSM', 'TSLA', 'V', 'WFC', 'XOM', 'XYZ']
+
+        self.symbols = sorted(set(symbols_F + symbols_M))
         self.status:str = 'Done'
 
 
     def download(self):
         self.status = 'Started'
 
+        self.downloadPrice()
+
+        edgarXDI = EdgarXDI("BHS")
+        edgarXDI.downloadFinancialData(self.symbols)
+        self.status = 'Done'
+
+
+    def downloadPrice(self):
+        print(f"Downloading Price ({len(self.symbols)} tickers)...")
+
         # 1. setup params for start and end
         training_window = 4 * 365
-        today = datetime.now(timezone.utc).date()
+        today = datetime.now(UTC).date()
         start_date = today - timedelta(days=training_window)
         end_date = today + timedelta(days=1)
 
@@ -119,11 +136,6 @@ class FeatureExtractor:
         price_df = price_df.sort_values('Date').reset_index(drop=True)
         price_df.to_csv(AinySchema.DATA_DIR+'price.csv')
 
-        edgarXDI = EdgarXDI("BHS")
-        edgarXDI.downloadFinancialData(self.symbols)
-        self.status = 'Done'
-
-
     def download_prices_in_chunks(self, symbols, start_date, end_date, chunk_size=50, delay_seconds=5):
         all_dfs = []
         # Split list into smaller chunks
@@ -132,9 +144,7 @@ class FeatureExtractor:
         ]
 
         for idx, chunk in enumerate(symbol_chunks, 1):
-            print(
-                f"Downloading chunk {idx}/{len(symbol_chunks)} ({len(chunk)} tickers)..."
-            )
+            print(f"Downloading chunk {idx}/{len(symbol_chunks)} ({len(chunk)} tickers)...")
             success = False
             max_retries = 3
 
@@ -202,8 +212,8 @@ class FeatureExtractor:
         universe_mean_return = price_tgt_df.groupby("Date")["Stock_Pct_Return"].transform("mean")
         price_tgt_df["Excess_Return"] = price_tgt_df["Stock_Pct_Return"] - universe_mean_return
 
-        LOWER_QUANTILE = 0.40  # Bottom 40% = Sell
-        UPPER_QUANTILE = 0.60  # Top 40% = Buy
+        LOWER_QUANTILE = 0.33  # Bottom 33% = Sell
+        UPPER_QUANTILE = 0.67  # Top 33% = Buy
         def assign_classes_with_buffer(group):
             if len(group) < 3:
                 return pd.Series(np.nan, index=group.index)
@@ -249,7 +259,7 @@ class FeatureExtractor:
 def main():
     print(f"=== Starting Feature Extraction : {datetime.now(ZoneInfo('America/New_York')).date()} ===")
     featureExtractor = FeatureExtractor("BHS")
-    #featureExtractor.download()
+    featureExtractor.download()
     if featureExtractor.status == 'Done':
         print("=== Feature Download Completed Successfully ===")
         featureExtractor.load();

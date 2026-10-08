@@ -1,6 +1,6 @@
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 
 import joblib
 import numpy as np
@@ -10,7 +10,8 @@ import yfinance as yf
 
 from services.consts.AinySchema import AinySchema
 from services.feature_xtor.FeatureXtor import FeatureExtractor
-from services.model_builder.ModelBuilder_CL import ModelBuilder
+from services.model_builder.ModelBuilder import ModelBuilder
+from services.analyzer.CoreAnalyzer import AinyFinSwingEngine
 
 BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "anypug.appspot.com")
 DIRECTORY_NAME = "ainyfin/models"
@@ -34,7 +35,7 @@ class Predictor:
 
         self.xg_model = modelBuilder.load_model()
         #print("Model Running:",  self.xg_model)
-        print("Model Running")
+        #print("Model Running")
 
         # 1. Get raw normalized importance scores
         importances = self.xg_model.feature_importances_
@@ -44,15 +45,14 @@ class Predictor:
             'Feature': self.xg_model.feature_names_in_,
             'Importance': importances}).sort_values(by='Importance', ascending=False)
 
-        print(feature_imp_df.to_string())
+        #print(feature_imp_df.to_string())
 
 
-    def create_input(self, modelBuilder:ModelBuilder, tickers):
+    def create_input(self, modelBuilder:ModelBuilder, predict_date, tickers):
         # 1. Fetch Current Live Market Prices
 
-        today = datetime.now(timezone.utc).date()
-        start_date = today - timedelta(days=3)
-        end_date = today
+        start_date = predict_date - timedelta(days=3)
+        end_date = predict_date + timedelta(days=1)
         featureExtractor = FeatureExtractor("BHS")
         new_price_df = featureExtractor.download_prices_in_chunks(tickers, start_date, end_date)
         if not new_price_df.empty:
@@ -120,7 +120,6 @@ class Predictor:
 
         # Save artifact for debugging
         final_df = latest_date_rows[expected_features + ["Ticker"]].reset_index(drop=True)
-        merged_df.to_csv(AinySchema.DATA_DIR + "pre-testdata.csv", index=False)
         final_df.to_csv(AinySchema.DATA_DIR + "testdata.csv", index=False)
         #print("Final input data generated successfully:\n", final_df)
         return final_df
@@ -265,12 +264,26 @@ class Predictor:
 
 
 def main(args:list[str]):
+    period:int = 365
+    if len(args) > 0:
+        try:
+            period = int(args[0])
+        except (ValueError, TypeError):
+            print("args[0] cannot be converted to an integer")
+            return
+
+    predict_date = datetime.now(UTC).date()
+    if len(args) > 1:
+        predict_date = datetime.strptime(args[1], "%m-%d-%Y").date()
+
+    save_reco:bool = True
     tickerlist:list[str] = []
-    if len(args) < 1:
+    if len(args) > 2:
+        tickerlist = [ticker.strip() for ticker in args[2].split(",")]
+        save_reco = False
+    else:
         featureExtractor = FeatureExtractor("BHS")
         tickerlist = featureExtractor.symbols
-    else:
-        tickerlist = [ticker.strip() for ticker in args[0].split(",")]
 
     if len(tickerlist) < 1:
         print("Ticker list needed")
@@ -280,13 +293,13 @@ def main(args:list[str]):
     modelBuilder = ModelBuilder("xg")
     predictor.init_runtime(modelBuilder)
 
-    input_df = predictor.create_input(modelBuilder, tickerlist)
+    ticker_dict = {}
+    input_df = predictor.create_input(modelBuilder, predict_date, tickerlist)
     if input_df.empty == False:
         valid_tickers = input_df['Ticker'].tolist()
         #results = predictor.predict(valid_tickers, input_df)
         results = predictor.predict_with_explanations(valid_tickers, input_df)
 
-        today = datetime.now(timezone.utc)
         reco_list = []
         for ticker, info in results.items():
             supp_str = ", ".join(info["Supported_By"]) if info["Supported_By"] else ""
@@ -299,13 +312,40 @@ def main(args:list[str]):
                 f"{info['Probabilities']} | Supported by: {supp_str} | Weakened by: {weak_str}"
             )
 
-            record = [ticker, today, info['Action'], f"{close:.2f}",  info['Confidence'], ",".join(info["Supported_By"]), ",".join(info["Weakened_By"])]
+            record = [ticker, predict_date, info['Action'], f"{close:.2f}",  info['Confidence'], info['Probabilities'], ",".join(info["Supported_By"]), ",".join(info["Weakened_By"])]
             reco_list.append(record)
+            print(f"Record for {ticker}:", info['Probabilities'].get('Buy'))
+            ticker_dict[ticker] = info['Probabilities'].get('Buy')
 
-        reco_df = pd.DataFrame(reco_list, columns=["Ticker", "Date", "Action", "Price", "Confidence", "SupportedBy", "WeakenedBy"])
-        reco_df.to_csv(AinySchema.DATA_DIR + "reco_ticker.csv", index=False)
+        reco_df = pd.DataFrame(reco_list, columns=["Ticker", "Date", "Action", "Price", "Confidence", 'Probabilities', "SupportedBy", "WeakenedBy"])
+
+        # 1. Instantiate Engine & Execute Analysis
+        engine = AinyFinSwingEngine()
+        trade_signal_list = engine.analyze_tickers(period, ticker_dict)
+        trade_signal_df = pd.DataFrame(trade_signal_list,  columns=["Ticker", "Recommendation", "Rationale", "Avg_Stock_Price", "Swing_Buy", "Swing_Sell", "Lot_Size"])
+        combined_df = pd.merge(reco_df, trade_signal_df, on="Ticker", how="left")
+        combined_df["Date"] = pd.to_datetime(combined_df["Date"]).astype("datetime64[ns]")
+        combined_df["Date"] = combined_df["Date"].dt.strftime("%Y-%m-%d")
+        combined_df = combined_df[["Ticker", 'Date', "Action", "Recommendation", "Price", "Avg_Stock_Price", "Swing_Buy", "Swing_Sell", "Lot_Size",
+                                    "Confidence", 'Probabilities', "Rationale", "SupportedBy", "WeakenedBy"]]
+
+        if save_reco:
+            formatted_date = predict_date.strftime("%y-%m-%d")
+            combined_df.to_csv(AinySchema.RESULT_DIR + "reco_ainyfin-"+formatted_date+".csv", index=False)
+
+        html_table_styled = combined_df.to_html(
+            index=False,
+            classes="table table-striped table-hover",
+            justify="left"
+        )
+
+        htmlFilename = AinySchema.RESULT_DIR + f"recommendations-{period}.html"
+        with open(htmlFilename, "w") as f:
+            f.write(html_table_styled)
+
     else:
         print("No input data available for tickers.")
+
 
 if __name__ == "__main__":
     main(sys.argv[1:])
