@@ -147,35 +147,35 @@ class AinyFinSwingEngine:
         rationale = []
 
         # Decision Logic: Model Conviction + Core Eligibility + Price Range
-        if prob_buy >= 0.65:
+        if prob_buy >= 0.67:
             if core_eval["Core_Eligible"]:
                 action = "BUY_CORE_AND_SWING"
                 target_lot = "Full Allocation (70% Core / 30% Swing)"
-                rationale.append("High model conviction + strong fundamental core score.")
+                rationale.append("High - Strong Core")
             else:
-                action = "BUY_TACTICAL_SWING_ONLY"
+                action = "BUY_SWING"
                 target_lot = "30% Tactical Swing Lot"
-                rationale.append("High model conviction, but failed Core eligibility criteria.")
+                rationale.append("High - Weak Core")
 
-        elif prob_buy <= 0.35:
+        elif prob_buy <= 0.33:
             if core_eval["Core_Eligible"]:
                 action = "TRIM_SWING_HOLD_CORE"
                 target_lot = "Sell Swing Portion / Keep Core"
-                rationale.append("Low short-term conviction; take profit/cut swing lot while holding core.")
+                rationale.append("Low - Strong Core/Weak Swing")
             else:
                 action = "SELL_ALL"
                 target_lot = "100% Exit"
-                rationale.append("Low conviction and lacks core fundamental support.")
+                rationale.append("Low - Weak Core")
 
         else:  # Neutral Model Zone (0.35 < prob_buy < 0.65)
             if avg_pct_range >= (self.min_swing_vol / 100.0):
-                action = "RANGE_SWING_ACCUMULATE"
+                action = "SWING_ACCUMULATE"
                 target_lot = "15% Scale-In Lot"
                 rationale.append(f"High volatility asset ({avg_pct_range*100:.2f}% avg range) in neutral trend; trade boundaries.")
             else:
                 action = "HOLD_NO_TRADE"
                 target_lot = "0%"
-                rationale.append("Neutral conviction and low intraday range.")
+                rationale.append("Neutral - Low Intraday Range")
 
         return {
             "Ticker": ticker,
@@ -183,10 +183,10 @@ class AinyFinSwingEngine:
             "Model_Prob_Buy": prob_buy,
             "Core_Score": core_eval["Core_Score"],
             "Core_Eligible": core_eval["Core_Eligible"],
-            "Recommended_Action": action,
-            "Target_Lot_Size": target_lot,
-            "Swing_Buy_Band": round(lower_swing_band, 2),
-            "Swing_Sell_Band": round(upper_swing_band, 2),
+            "Recommendation": action,
+            "Lot_Size": target_lot,
+            "Swing_Buy": round(lower_swing_band, 2),
+            "Swing_Sell": round(upper_swing_band, 2),
             "Rationale": " | ".join(rationale)
         }
 
@@ -248,6 +248,7 @@ class AinyFinSwingEngine:
         input_df = self.create_input(tickerlist)
         latest_price_df =  self.get_current_price(tickerlist)
 
+        trade_signal_list = []
         for ticker in tickerlist:
             input_ticker_df = input_df[input_df["Ticker"] == ticker].copy()
             input_ticker_df['Date'] = pd.to_datetime(input_ticker_df['Date'])
@@ -289,11 +290,13 @@ class AinyFinSwingEngine:
                 vol_stats=vol_stats
             )
 
+            trade_signal_list.append(trade_signal)
             print("\n=== Strategic Allocation Signal ===")
             for k, v in trade_signal.items():
                 print(f"  {k}: {v}")
-
             print("===" * 20)
+
+        return trade_signal_list
 
 
 #"{'AMD':0.67, 'ICE':0.55, 'AAPL':0.72, 'MSFT':0.61, 'GOOG':0.58, 'AMZN':0.63}"

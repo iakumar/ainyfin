@@ -266,6 +266,14 @@ class Predictor:
 
 
 def main(args:list[str]):
+    period:int = 365
+    if len(args) > 0:
+        try:
+            period = int(args[0])
+        except (ValueError, TypeError):
+            print("args[0] cannot be converted to an integer")
+            return
+
     tickerlist:list[str] = []
     if len(args) > 1:
         tickerlist = [ticker.strip() for ticker in args[1].split(",")]
@@ -297,25 +305,36 @@ def main(args:list[str]):
             close = ticker_df["Close"].item()
 
             print(
-                f"{ticker}: {info['Action']} @ {close:.2f} | {info['Confidence']}"
+                f"{ticker}: {info['Action']} @ {close:.2f} | {info['Confidence']} | "
                 f"{info['Probabilities']} | Supported by: {supp_str} | Weakened by: {weak_str}"
             )
 
-            record = [ticker, today, info['Action'], f"{close:.2f}",  info['Confidence'], ",".join(info["Supported_By"]), ",".join(info["Weakened_By"])]
+            record = [ticker, today, info['Action'], f"{close:.2f}",  info['Confidence'], info['Probabilities'], ",".join(info["Supported_By"]), ",".join(info["Weakened_By"])]
             reco_list.append(record)
             print(f"Record for {ticker}:", info['Probabilities'].get('Buy'))
             ticker_dict[ticker] = info['Probabilities'].get('Buy')
 
-        reco_df = pd.DataFrame(reco_list, columns=["Ticker", "Date", "Action", "Price", "Confidence", "SupportedBy", "WeakenedBy"])
-        reco_df.to_csv(AinySchema.DATA_DIR + "reco_ticker.csv", index=False)
-
-        period:int = 365
-        if len(args) > 0:
-            period = int(args[0])
+        reco_df = pd.DataFrame(reco_list, columns=["Ticker", "Date", "Action", "Price", "Confidence", 'Probabilities', "SupportedBy", "WeakenedBy"])
 
         # 1. Instantiate Engine & Execute Analysis
         engine = AinyFinSwingEngine()
-        engine.analyze_tickers(period, ticker_dict)
+        trade_signal_list = engine.analyze_tickers(period, ticker_dict)
+        trade_signal_df = pd.DataFrame(trade_signal_list,  columns=["Ticker", "Recommendation", "Rationale", "Swing_Buy", "Swing_Sell", "Lot_Size"])
+        combined_df = pd.merge(reco_df, trade_signal_df, on="Ticker", how="left")
+        combined_df["Date"] = combined_df["Date"].dt.strftime("%Y-%m-%d")
+
+        formatted_date = today.strftime("%m-%d-%y")
+        combined_df.to_csv(AinySchema.DATA_DIR + "reco_ainyfin-"+formatted_date+".csv", index=False)
+
+        html_table_styled = combined_df.to_html(
+            index=False,
+            classes="table table-striped table-hover",
+            justify="left"
+        )
+
+        with open(AinySchema.DATA_DIR +"recommendations.html", "w") as f:
+            f.write(html_table_styled)
+
 
     else:
         print("No input data available for tickers.")
