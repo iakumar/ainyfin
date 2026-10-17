@@ -171,11 +171,11 @@ class AinyFinSwingEngine:
             if avg_pct_range >= (self.min_swing_vol / 100.0):
                 action = "SWING_ACCUMULATE"
                 target_lot = "15% Scale-In Lot"
-                rationale.append(f"High volatility asset ({avg_pct_range*100:.2f}% avg range) in neutral trend; trade boundaries.")
+                rationale.append(f"High intraday volatility({avg_pct_range*100:.2f}% avg range) in neutral trend")
             else:
                 action = "HOLD_NO_TRADE"
                 target_lot = "0%"
-                rationale.append("Neutral - Low Intraday Range")
+                rationale.append("Low intraday volatility")
 
         return {
             "Ticker": ticker,

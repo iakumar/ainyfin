@@ -121,7 +121,6 @@ class Predictor:
 
         # Save artifact for debugging
         final_df = latest_date_rows[expected_features + ["Ticker"]].reset_index(drop=True)
-        merged_df.to_csv(AinySchema.DATA_DIR + "pre-testdata.csv", index=False)
         final_df.to_csv(AinySchema.DATA_DIR + "testdata.csv", index=False)
         #print("Final input data generated successfully:\n", final_df)
         return final_df
@@ -321,9 +320,9 @@ def main(args:list[str]):
         trade_signal_list = engine.analyze_tickers(period, ticker_dict)
         trade_signal_df = pd.DataFrame(trade_signal_list,  columns=["Ticker", "Recommendation", "Rationale", "Swing_Buy", "Swing_Sell", "Lot_Size"])
         combined_df = pd.merge(reco_df, trade_signal_df, on="Ticker", how="left")
-        combined_df["Date"] = combined_df["Date"].dt.strftime("%Y-%m-%d")
+        combined_df = combined_df[["Ticker", "Action", "Recommendation", "Price", "Swing_Buy", "Swing_Sell", "Lot_Size", "Confidence", 'Probabilities', "Rationale", "SupportedBy", "WeakenedBy"]]
 
-        formatted_date = today.strftime("%m-%d-%y")
+        formatted_date = today.strftime("%y-%m-%d")
         combined_df.to_csv(AinySchema.DATA_DIR + "reco_ainyfin-"+formatted_date+".csv", index=False)
 
         html_table_styled = combined_df.to_html(

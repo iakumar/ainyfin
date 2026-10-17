@@ -23,7 +23,7 @@ class FeatureExtractor:
             'ETN', 'GE', 'GEV', 'GOOG', 'GOOGL', 'GRMN', 'GS', 'HOOD', 'ICE', 'INTU',
             'IQV', 'IR', 'JNJ', 'JPM', 'KO', 'LRCX', 'MANH', 'MDLZ', 'META',
             'MRK', 'MSFT', 'NET', 'NFLX', 'NVDA', 'PANW', 'PG', 'PLTR', 'PSX',
-            'SNOW', 'SO', 'T', 'TMO', 'TSM', 'TT', 'TROW', 'V', 'WFC', 'WMT',
+            'SNOW', 'SO', 'T', 'TMO', 'TSLA', 'TSM', 'TT', 'TROW', 'V', 'WFC', 'WMT',
             'XOM', 'XYZ',
 
             # --- Appended S&P 500 Components ---
@@ -82,11 +82,18 @@ class FeatureExtractor:
             'SPYG', 'SPY', 'SPMO', 'USO'
         ]
 
-        #first 100 elements
+        #first 300 elements
         self.symbols = self.symbols[:300]
         #self.symbols = ['SPY','SPYG','SPMO']
-        #self.symbols = ['MANH','ICE','AMD']
+        #
+        symbols_F = ['AAPL', 'ABNB', 'AMD', 'AMGN', 'ASML', 'CRWD', 'DAL', 'DUK', 'EOG', 'ETN', 'GE', 'GEV', 'GOOGL', 'GRMN', 'GS',
+                        'INTU', 'IQV', 'JNJ', 'JPM', 'KO', 'LRCX', 'MANH', 'MRK', 'MSFT', 'NET', 'NFLX', 'NVDA', 'PG', 'PLTR',
+                         'SO', 'T', 'TSM', 'TSLA']
 
+        symbols_M = ['C', 'CBRE', 'GOOG', 'HOOD', 'ICE', 'IR', 'MDLZ', 'META', 'NET', 'NFLX', 'PANW', 'PSX', 'SNOW', 'TMO', 'TROW', 'TT',
+                          'SNOW', 'T', 'TMO', 'TSM', 'TSLA', 'V', 'WFC', 'XOM', 'XYZ']
+
+        self.symbols = sorted(set(symbols_F + symbols_M))
         self.status:str = 'Done'
 
 
