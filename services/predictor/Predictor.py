@@ -10,7 +10,7 @@ import yfinance as yf
 
 from services.consts.AinySchema import AinySchema
 from services.feature_xtor.FeatureXtor import FeatureExtractor
-from services.model_builder.ModelBuilder_CL import ModelBuilder
+from services.model_builder.ModelBuilder import ModelBuilder
 from services.analyzer.CoreAnalyzer import AinyFinSwingEngine
 
 BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "anypug.appspot.com")
@@ -53,7 +53,7 @@ class Predictor:
 
         today = datetime.now(timezone.utc).date()
         start_date = today - timedelta(days=3)
-        end_date = today
+        end_date = today + timedelta(days=1)
         featureExtractor = FeatureExtractor("BHS")
         new_price_df = featureExtractor.download_prices_in_chunks(tickers, start_date, end_date)
         if not new_price_df.empty:
@@ -273,9 +273,11 @@ def main(args:list[str]):
             print("args[0] cannot be converted to an integer")
             return
 
+    save_reco:bool = True
     tickerlist:list[str] = []
     if len(args) > 1:
         tickerlist = [ticker.strip() for ticker in args[1].split(",")]
+        save_reco = False
     else:
         featureExtractor = FeatureExtractor("BHS")
         tickerlist = featureExtractor.symbols
@@ -318,12 +320,15 @@ def main(args:list[str]):
         # 1. Instantiate Engine & Execute Analysis
         engine = AinyFinSwingEngine()
         trade_signal_list = engine.analyze_tickers(period, ticker_dict)
-        trade_signal_df = pd.DataFrame(trade_signal_list,  columns=["Ticker", "Recommendation", "Rationale", "Swing_Buy", "Swing_Sell", "Lot_Size"])
+        trade_signal_df = pd.DataFrame(trade_signal_list,  columns=["Ticker", "Recommendation", "Rationale", "Avg_Stock_Price", "Swing_Buy", "Swing_Sell", "Lot_Size"])
         combined_df = pd.merge(reco_df, trade_signal_df, on="Ticker", how="left")
-        combined_df = combined_df[["Ticker", "Action", "Recommendation", "Price", "Swing_Buy", "Swing_Sell", "Lot_Size", "Confidence", 'Probabilities', "Rationale", "SupportedBy", "WeakenedBy"]]
+        combined_df["Date"] = combined_df["Date"].dt.strftime("%Y-%m-%d")
+        combined_df = combined_df[["Ticker", 'Date', "Action", "Recommendation", "Price", "Avg_Stock_Price", "Swing_Buy", "Swing_Sell", "Lot_Size",
+                                    "Confidence", 'Probabilities', "Rationale", "SupportedBy", "WeakenedBy"]]
 
-        formatted_date = today.strftime("%y-%m-%d")
-        combined_df.to_csv(AinySchema.DATA_DIR + "reco_ainyfin-"+formatted_date+".csv", index=False)
+        if save_reco:
+            formatted_date = today.strftime("%y-%m-%d")
+            combined_df.to_csv(AinySchema.DATA_DIR + "reco_ainyfin-"+formatted_date+".csv", index=False)
 
         html_table_styled = combined_df.to_html(
             index=False,
@@ -331,9 +336,9 @@ def main(args:list[str]):
             justify="left"
         )
 
-        with open(AinySchema.DATA_DIR +"recommendations.html", "w") as f:
+        htmlFilename = AinySchema.DATA_DIR + f"recommendations-{period}.html"
+        with open(htmlFilename, "w") as f:
             f.write(html_table_styled)
-
 
     else:
         print("No input data available for tickers.")

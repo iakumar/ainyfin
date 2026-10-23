@@ -290,6 +290,8 @@ class AinyFinSwingEngine:
                 vol_stats=vol_stats
             )
 
+            trade_signal["Avg_Stock_Price"] = vol_stats["Avg_Stock_Price"]
+
             trade_signal_list.append(trade_signal)
             print("\n=== Strategic Allocation Signal ===")
             for k, v in trade_signal.items():
